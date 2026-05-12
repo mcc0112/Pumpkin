@@ -6,6 +6,7 @@ use pumpkin_core::propagation::PropagationContext;
 use pumpkin_core::propagation::Propagator;
 use pumpkin_core::propagation::PropagatorConstructor;
 use pumpkin_core::propagation::PropagatorConstructorContext;
+use pumpkin_core::propagation::ReadDomains;
 use pumpkin_core::variables::IntegerVariable;
 use pumpkin_core::propagation::DomainEvents;
 use pumpkin_core::propagation::LocalId;
@@ -77,7 +78,58 @@ impl<Var: IntegerVariable + 'static> Propagator for AllDifferentPropagator<Var> 
         self.check_matching_conflict(context.domains())
     }
 }
-
+struct BipartiteGraph {
+    n_vars: usize,
+    n_vals: usize,
+    /// adj[var_index] = list of value-indices (0-indexed) in domain of var i.
+    adj: Vec<Vec<usize>>,
+    /// Shift so that domain values map to 0-indexed value-nodes.
+    /// For MiniZinc 1-indexed successors this is always 1.
+    val_offset: i32,
+}
+ 
+impl BipartiteGraph {
+    fn debug_print(&self) {
+        println!("BipartiteGraph:");
+        println!("  n_vars = {}", self.n_vars);
+        println!("  n_vals = {}", self.n_vals);
+        println!("  val_offset = {}", self.val_offset);
+        for (i, neighbors) in self.adj.iter().enumerate() {
+            print!("  var {} ->", i);
+            for &idx in neighbors {
+                let val = index_to_domain_value(idx);
+                print!(" {}(idx={})", val, idx);
+            }
+            println!();
+        }
+    }
+    fn build<Var: IntegerVariable>(successors: &[Var], domains: Domains) -> Self {
+        // Find global min/max over all domains to size the value array.
+        let val_offset = successors
+            .iter()
+            .map(|v| domains.lower_bound(v))
+            .min()
+            .unwrap_or(1);
+ 
+        let max_val = successors
+            .iter()
+            .map(|v| domains.upper_bound(v))
+            .max()
+            .unwrap_or(val_offset);
+ 
+        let n_vars = successors.len();
+        let n_vals = (max_val - val_offset + 1) as usize;
+        let mut adj = vec![Vec::new(); n_vars];
+ 
+        for (i, var) in successors.iter().enumerate() {
+            for val in domains.iterate_domain(var) {
+                adj[i].push((val - val_offset) as usize);
+            }
+        }
+ 
+        BipartiteGraph { n_vars, n_vals, adj, val_offset }
+    }
+}
 
 impl<Var: IntegerVariable + 'static> AllDifferentPropagator<Var> {
     fn check_matching_conflict(&self, domains: Domains) -> PropagationStatusCP {
@@ -87,5 +139,62 @@ impl<Var: IntegerVariable + 'static> AllDifferentPropagator<Var> {
         //Step 4 : Derive hall violation
         //Step 5 build explanation + report conflict.
         todo!()
+    }
+}
+
+
+
+
+ 
+const VALUE_OFFSET: usize = 1;
+ 
+#[inline]
+fn domain_value_to_index(domain_value: i32) -> usize {
+    domain_value as usize - VALUE_OFFSET
+}
+ 
+#[inline]
+fn index_to_domain_value(index: usize) -> i32 {
+    index as i32 + VALUE_OFFSET as i32
+}
+
+
+
+
+#[cfg(test)]
+mod tests { 
+    use super::*;
+    use pumpkin_checking::CheckerVariable;
+use pumpkin_core::state::State;
+    use pumpkin_core::variables::IntegerVariable;
+
+    #[test]
+    fn test_bipartite_graph_simple() {
+        let mut state = State::default();
+
+        // Create 3 variables with initial domain [1..3]
+        let x = state.new_interval_variable(1, 2, None);
+        let y = state.new_interval_variable(2, 3, None);
+        let z = state.new_interval_variable(1, 3, None);
+
+        let successors = vec![x, y, z].into_boxed_slice();
+
+        // Build the graph directly (no propagation needed)
+        let graph = BipartiteGraph::build(&successors, state.get_domains());
+        graph.debug_print();
+        // Check graph structure
+        assert_eq!(graph.n_vars, 3);
+        assert_eq!(graph.val_offset, 1);
+        assert_eq!(graph.n_vals, 3); // values 1,2,3 → indices 0,1,2
+
+        // Convert adjacency lists back to domain values
+        let neighbors_as_values: Vec<Vec<i32>> = graph.adj
+            .iter()
+            .map(|ns| ns.iter().map(|&idx| index_to_domain_value(idx)).collect())
+            .collect();
+
+        assert_eq!(neighbors_as_values[0], vec![1, 2]); // x
+        assert_eq!(neighbors_as_values[1], vec![2, 3]); // y
+        assert_eq!(neighbors_as_values[2], vec![1, 2, 3]); // z
     }
 }
