@@ -31,6 +31,7 @@ pub struct CircuitConstructor<Var> {
 // Propagator struct. Contains propagator info and inference code (latter for explanations)
 #[derive(Debug, Clone)]
 pub struct CircuitPropagator<Var> {
+    first_iteration: bool, 
     pub successors: Box<[Var]>,
     // fields (and maybe extra ones)
     inference_code: InferenceCode,
@@ -70,6 +71,7 @@ where
         // create the actual propagator and generate new inference code
         CircuitPropagator {
             // set variables to base values
+            first_iteration: true, 
             successors: self.successors,
             inference_code: InferenceCode::new(self.constraint_tag, CircuitPrevent),
         }
@@ -94,12 +96,24 @@ impl<Var: IntegerVariable + 'static> Propagator for CircuitPropagator<Var> {
     fn name(&self) -> &str {
     "Circuit"
     }
+    fn propagate(&mut self, mut context: PropagationContext) -> PropagationStatusCP {
+        // If it is the first iteration, then we remove self-loops
+        if self.first_iteration {
+            self.first_iteration = false;
+            self.remove_self_loops(&mut context)?;
+        }
 
+        self.check(context.domains())?;
+        self.prevent(context)
+    }
+    
     fn propagate_from_scratch(&self, mut context: PropagationContext) -> PropagationStatusCP {
         self.remove_self_loops(&mut context)?;
         self.check(context.domains())?;
         self.prevent(context)
     }
+
+
     // defining name, but also priority (?), notify (?), notify__backtrack (?), propagate (when is this called), propagate_from_scratch (and when this? and why was this not implemented in reference)
 }
 
