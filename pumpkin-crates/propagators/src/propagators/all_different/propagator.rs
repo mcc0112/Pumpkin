@@ -267,6 +267,9 @@ fn find_hall_set(graph: &BipartiteGraph, m: &Matching) -> (Vec<usize>, Vec<usize
     let hall_vars: Vec<usize> = (0..graph.n_vars).filter(|&i| var_visited[i]).collect();
     let hall_vals: Vec<usize> = (0..graph.n_vals).filter(|&v| val_visited[v]).collect();
  
+    // This holds by König's theorem: the alternating-reachable set from
+    // unmatched variables always has a strictly smaller neighbourhood when
+    // the matching is not perfect. If this fires, hopcroft_karp has a bug.
     debug_assert!(
         hall_vals.len() < hall_vars.len(),
         "Bug in Hall extraction: |N(S)|={} >= |S|={}",
@@ -494,6 +497,16 @@ mod tests {
     fn conflict_all_vars_forced_to_one() {
         let mut state = make_state(&[(7,7),(7,7),(7,7)]);
         assert!(state.propagate_to_fixed_point().is_err());
+    }
+    #[test]
+    fn conflict_subset_hall_violation_five_vars() {
+        // Only vars 0..2 form the Hall violation ({1,2} has only 2 values for 3 vars).
+        // Vars 3 and 4 have a wide enough domain — the solver must isolate the subset.
+        let mut state = make_state(&[(1, 2), (1, 2), (1, 2), (1, 10), (1, 10)]);
+        assert!(
+            state.propagate_to_fixed_point().is_err(),
+            "subset of 3 vars crowding 2 values is a Hall violation even with other vars present"
+        );
     }
   
 }
