@@ -1,0 +1,15 @@
+[project]
+name = "pumpkin-circuit-experiments"
+version = "0.1.0"
+description = "Benchmark harness for the circuit propagator in Pumpkin (LCG solver)"
+requires-python = ">=3.11"
+
+dependencies = [
+    "pandas>=2.0",
+    "matplotlib>=3.7",
+]
+
+[tool.uv]
+# Keep the virtual-environment inside the experiments folder so it stays
+# out of the way of the Rust workspace.
+venv-dir = ".venv"
