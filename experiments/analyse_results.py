@@ -7,11 +7,31 @@ treats the older one as "baseline" and the newer one as "new", then:
 
   • Prints a per-configuration comparison table to the terminal
   • Writes  experiments/results/comparison_<timestamp>.csv
-  • Saves four PNG plots:
-      plot_runtime.png           – wall-clock time  (grouped bars + raw dots)
-      plot_search_reduction.png  – failures / backtracks
-      plot_explanation.png       – noGoods generated
-      plot_speedup.png           – runtime speedup ratio  baseline / new
+  • Saves plots grouped by research dimension:
+
+    Runtime
+      plot_runtime.png               – wall_time_s  (grouped bars + raw dots)
+      plot_runtime_breakdown.png     – initTime vs solveTime  (stacked bars)
+
+    Search reduction
+      plot_search_failures.png       – failures
+      plot_search_nodes.png          – nodes
+      plot_search_propagations.png   – propagations
+      plot_search_peakdepth.png      – peakDepth
+      plot_search_restarts.png       – restarts
+
+    Explanation quality
+      plot_expl_lbd.png              – AverageLbd          (lower = better)
+      plot_expl_nogood_length.png    – AverageLearnedNogoodLength
+      plot_expl_nogoods.png          – nogoods (total learned)
+      plot_expl_unit_nogoods.png     – NumUnitNogoodsLearned
+
+    Explanation cost
+      plot_expl_conflict_size.png    – AverageConflictSize
+      plot_expl_backtrack.png        – AverageBacktrackAmount
+
+    Summary
+      plot_speedup.png               – runtime speedup ratio  baseline / new
 
 Usage (from the Pumpkin project root)
 --------------------------------------
@@ -23,17 +43,10 @@ Options
   --new      PATH   Explicit path to the new-propagator CSV
   --out      PATH   Output directory  (default: experiments/results/)
 
-If neither --baseline nor --new is given the script auto-detects the two
-most-recent stats_*.csv files in experiments/results/ (older = baseline,
-newer = new).
-
 Column mapping
 --------------
 Edit METRIC_COLS near the top of the file if your solver uses different
-stat names.  The defaults are:
-  runtime             → wall_time_s      (always present)
-  search reduction    → failures         (%%%mzn-stat: failures=…)
-  explanation overhead→ noGoods          (%%%mzn-stat: noGoods=…)
+stat names.
 """
 
 import argparse
@@ -59,16 +72,58 @@ except ImportError:
 # Configuration – edit these if your solver emits different stat names
 # ---------------------------------------------------------------------------
 
+# All metrics, grouped by research dimension.
+# Format: { "Human-readable label": "csv_column_name" }
+
 METRIC_COLS: dict[str, str] = {
-    # Human-readable label        : CSV column name
-    "Runtime (s)"                 : "wall_time_s",
-    "Failures (backtracks)"       : "failures",
-    "noGoods"                     : "noGoods",
+    # --- Runtime ---
+    "Wall-clock time (s)"               : "wall_time_s",
+    "Init time (s)"                     : "initTime",
+    "Solve time (s)"                    : "solveTime",
+
+    # --- Search reduction ---
+    "Failures (backtracks)"             : "failures",
+    "Nodes explored"                    : "nodes",
+    "Propagations"                      : "propagations",
+    "Peak depth"                        : "peakDepth",
+    "Restarts"                          : "restarts",
+
+    # --- Explanation quality ---
+    "Average LBD"                       : "AverageLbd",
+    "Avg learned nogood length"         : "AverageLearnedNogoodLength",
+    "Nogoods learned (total)"           : "nogoods",
+    "Unit nogoods learned"              : "NumUnitNogoodsLearned",
+
+    # --- Explanation cost ---
+    "Average conflict size"             : "AverageConflictSize",
+    "Average backtrack amount"          : "AverageBacktrackAmount",
 }
 
-RUNTIME_COL      = "wall_time_s"
-SEARCH_COL       = "failures"
-EXPLANATION_COL  = "noGoods"
+# Columns used for dedicated plots
+RUNTIME_COL          = "wall_time_s"
+INIT_COL             = "initTime"
+SOLVE_COL            = "solveTime"
+
+SEARCH_COLS: dict[str, tuple[str, str, str]] = {
+    # filename_suffix       : (csv_col,            ylabel,                        "lower/higher is better" note)
+    "failures"   : ("failures",             "Mean failures (backtracks)",   "lower is better"),
+    "nodes"      : ("nodes",                "Mean nodes explored",          "lower is better"),
+    "propagations": ("propagations",        "Mean propagations",            "lower is better"),
+    "peakdepth"  : ("peakDepth",            "Mean peak search depth",       "lower is better"),
+    "restarts"   : ("restarts",             "Mean restarts",                "informational"),
+}
+
+EXPL_QUALITY_COLS: dict[str, tuple[str, str, str]] = {
+    "lbd"           : ("AverageLbd",                 "Mean average LBD",                     "lower = stronger"),
+    "nogood_length" : ("AverageLearnedNogoodLength",  "Mean avg learned nogood length",       "lower = stronger"),
+    "nogoods"       : ("nogoods",                    "Mean nogoods learned (total)",          "informational"),
+    "unit_nogoods"  : ("NumUnitNogoodsLearned",       "Mean unit nogoods learned",            "higher = stronger"),
+}
+
+EXPL_COST_COLS: dict[str, tuple[str, str, str]] = {
+    "conflict_size" : ("AverageConflictSize",         "Mean average conflict size",           "lower = cheaper"),
+    "backtrack"     : ("AverageBacktrackAmount",       "Mean average backtrack amount",        "lower = cheaper"),
+}
 
 LABEL_BASELINE   = "baseline"
 LABEL_NEW        = "new"
@@ -97,7 +152,7 @@ def two_latest_csvs(results_dir: Path) -> tuple[Path, Path]:
             "Run the experiments with both propagators first, or pass "
             "--baseline and --new explicitly."
         )
-    return csvs[-2], csvs[-1]   # (older = baseline, newer = new)
+    return csvs[-2], csvs[-1]
 
 
 # ---------------------------------------------------------------------------
@@ -105,7 +160,6 @@ def two_latest_csvs(results_dir: Path) -> tuple[Path, Path]:
 # ---------------------------------------------------------------------------
 
 def _coerce_numerics(df: pd.DataFrame) -> pd.DataFrame:
-    """Convert columns to numeric where possible (pandas-2.x safe)."""
     for col in df.columns:
         converted = pd.to_numeric(df[col], errors="coerce")
         if converted.notna().any():
@@ -130,18 +184,13 @@ def config_label(n: int | float, k: int | float) -> str:
 
 
 def mean_per_config(df: pd.DataFrame, col: str) -> pd.Series:
-    """Mean of *col* over successful runs, indexed by (config_n, config_k)."""
     ok = df[df["status"] == "ok"] if "status" in df.columns else df
     if col not in ok.columns:
         return pd.Series(dtype=float)
     return ok.groupby(GROUP_KEYS)[col].mean()
 
 
-def raw_per_config(
-    df: pd.DataFrame,
-    col: str,
-) -> dict[tuple, list[float]]:
-    """All individual (successful) values, keyed by (config_n, config_k)."""
+def raw_per_config(df: pd.DataFrame, col: str) -> dict[tuple, list[float]]:
     ok = df[df["status"] == "ok"] if "status" in df.columns else df
     if col not in ok.columns:
         return {}
@@ -161,12 +210,6 @@ def build_comparison_table(
     df_base: pd.DataFrame,
     df_new:  pd.DataFrame,
 ) -> pd.DataFrame:
-    """
-    For every metric and every (n, k) configuration return a tidy DataFrame
-    with columns:
-      metric, config_n, config_k, config,
-      baseline_mean, new_mean, abs_diff, rel_diff_%
-    """
     rows = []
     for display_name, col in METRIC_COLS.items():
         base_means = mean_per_config(df_base, col)
@@ -206,9 +249,6 @@ def _grouped_bar_with_points(
     ylabel: str,
     title:  str,
 ) -> None:
-    """
-    Grouped bar chart (baseline vs new) with individual run dots overlaid.
-    """
     x     = np.arange(len(configs))
     width = 0.35
     rng   = np.random.default_rng(seed=0)
@@ -218,7 +258,6 @@ def _grouped_bar_with_points(
     ax.bar(x + width / 2, new_vals,  width,
            label=LABEL_NEW,      color=COLORS[LABEL_NEW],      alpha=0.82, zorder=2)
 
-    # Overlay raw data points
     for i, cfg in enumerate(all_configs):
         for offset, raw_dict in [(-width / 2, base_raw), (+width / 2, new_raw)]:
             pts = raw_dict.get(cfg, [])
@@ -246,7 +285,7 @@ def _save(fig: "plt.Figure", path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Individual comparison plots
+# Generic metric plot
 # ---------------------------------------------------------------------------
 
 def plot_metric(
@@ -269,7 +308,6 @@ def plot_metric(
     labels  = [config_label(*c) for c in all_configs]
     b_vals  = [float(base_means.get(c, 0)) for c in all_configs]
     n_vals  = [float(new_means.get(c,  0)) for c in all_configs]
-
     base_raw = raw_per_config(df_base, col)
     new_raw  = raw_per_config(df_new,  col)
 
@@ -282,16 +320,73 @@ def plot_metric(
     _save(fig, out_dir / filename)
 
 
-def plot_speedup(
+# ---------------------------------------------------------------------------
+# Runtime breakdown: stacked bar  initTime + solveTime
+# ---------------------------------------------------------------------------
+
+def plot_runtime_breakdown(
     df_base: pd.DataFrame,
     df_new:  pd.DataFrame,
     out_dir: Path,
 ) -> None:
     """
-    Horizontal bar chart of runtime speedup = baseline_mean / new_mean.
-    Values > 1  →  new propagator is faster.
-    Values < 1  →  new propagator is slower.
+    Stacked bar: initTime (hatched) + solveTime (solid) for each config.
+    Helps reveal whether matching-based approach pays higher init cost.
     """
+    init_b  = mean_per_config(df_base, INIT_COL)
+    solve_b = mean_per_config(df_base, SOLVE_COL)
+    init_n  = mean_per_config(df_new,  INIT_COL)
+    solve_n = mean_per_config(df_new,  SOLVE_COL)
+
+    if init_b.empty and solve_b.empty:
+        print(f"  Columns '{INIT_COL}'/'{SOLVE_COL}' not found – skipping runtime breakdown")
+        return
+
+    all_configs = sorted(
+        init_b.index.union(solve_b.index).union(init_n.index).union(solve_n.index)
+    )
+    labels  = [config_label(*c) for c in all_configs]
+    x       = np.arange(len(labels))
+    width   = 0.35
+
+    ib = [float(init_b.get(c,  0)) for c in all_configs]
+    sb = [float(solve_b.get(c, 0)) for c in all_configs]
+    in_ = [float(init_n.get(c,  0)) for c in all_configs]
+    sn  = [float(solve_n.get(c, 0)) for c in all_configs]
+
+    fig, ax = plt.subplots(figsize=(max(7, len(labels) * 1.05), 5))
+
+    ax.bar(x - width / 2, ib, width, label=f"{LABEL_BASELINE} – init",
+           color=COLORS[LABEL_BASELINE], alpha=0.5, hatch="//", zorder=2)
+    ax.bar(x - width / 2, sb, width, bottom=ib, label=f"{LABEL_BASELINE} – solve",
+           color=COLORS[LABEL_BASELINE], alpha=0.85, zorder=2)
+
+    ax.bar(x + width / 2, in_, width, label=f"{LABEL_NEW} – init",
+           color=COLORS[LABEL_NEW], alpha=0.5, hatch="//", zorder=2)
+    ax.bar(x + width / 2, sn,  width, bottom=in_, label=f"{LABEL_NEW} – solve",
+           color=COLORS[LABEL_NEW], alpha=0.85, zorder=2)
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, fontsize=8)
+    ax.set_ylabel("Mean time (s)")
+    ax.set_title(
+        f"Runtime breakdown  [{LABEL_BASELINE} vs {LABEL_NEW}]\n"
+        "Hatched = init time,  Solid = solve time"
+    )
+    ax.legend(fontsize=8)
+    ax.grid(axis="y", linestyle="--", alpha=0.45, zorder=0)
+    _save(fig, out_dir / "plot_runtime_breakdown.png")
+
+
+# ---------------------------------------------------------------------------
+# Speedup summary
+# ---------------------------------------------------------------------------
+
+def plot_speedup(
+    df_base: pd.DataFrame,
+    df_new:  pd.DataFrame,
+    out_dir: Path,
+) -> None:
     base_means = mean_per_config(df_base, RUNTIME_COL)
     new_means  = mean_per_config(df_new,  RUNTIME_COL)
     if base_means.empty:
@@ -337,21 +432,15 @@ def parse_args() -> argparse.Namespace:
         description="Compare two circuit-propagator benchmark runs.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    p.add_argument("--baseline", type=Path, default=None,
-                   help="CSV from the baseline propagator run "
-                        "(default: second-most-recent stats_*.csv)")
-    p.add_argument("--new",      type=Path, default=None,
-                   help="CSV from the new propagator run "
-                        "(default: most-recent stats_*.csv)")
-    p.add_argument("--out",      type=Path, default=RESULTS_DIR,
-                   help="Output directory for plots and comparison CSV")
+    p.add_argument("--baseline", type=Path, default=None)
+    p.add_argument("--new",      type=Path, default=None)
+    p.add_argument("--out",      type=Path, default=RESULTS_DIR)
     return p.parse_args()
 
 
 def main() -> None:
     args = parse_args()
 
-    # ---- Resolve input files -----------------------------------------------
     if args.baseline and args.new:
         path_base, path_new = args.baseline, args.new
     elif args.baseline or args.new:
@@ -392,33 +481,43 @@ def main() -> None:
 
     print("\n--- Generating plots ---")
 
+    # Runtime
     plot_metric(
         df_base, df_new,
-        col      = RUNTIME_COL,
-        ylabel   = "Mean wall-clock time (s)",
-        title    = f"Runtime  [{LABEL_BASELINE} vs {LABEL_NEW}]",
-        filename = "plot_runtime.png",
-        out_dir  = args.out,
+        col="wall_time_s", ylabel="Mean wall-clock time (s)",
+        title=f"Runtime  [{LABEL_BASELINE} vs {LABEL_NEW}]",
+        filename="plot_runtime.png", out_dir=args.out,
     )
+    plot_runtime_breakdown(df_base, df_new, args.out)
 
-    plot_metric(
-        df_base, df_new,
-        col      = SEARCH_COL,
-        ylabel   = "Mean failures (backtracks)",
-        title    = f"Search reduction  [{LABEL_BASELINE} vs {LABEL_NEW}]  – fewer is better",
-        filename = "plot_search_reduction.png",
-        out_dir  = args.out,
-    )
+    # Search reduction
+    for suffix, (col, ylabel, note) in SEARCH_COLS.items():
+        plot_metric(
+            df_base, df_new,
+            col=col, ylabel=ylabel,
+            title=f"Search – {ylabel}  [{LABEL_BASELINE} vs {LABEL_NEW}]  ({note})",
+            filename=f"plot_search_{suffix}.png", out_dir=args.out,
+        )
 
-    plot_metric(
-        df_base, df_new,
-        col      = EXPLANATION_COL,
-        ylabel   = "Mean noGoods generated",
-        title    = f"Explanation overhead  [{LABEL_BASELINE} vs {LABEL_NEW}]  – fewer is better",
-        filename = "plot_explanation.png",
-        out_dir  = args.out,
-    )
+    # Explanation quality
+    for suffix, (col, ylabel, note) in EXPL_QUALITY_COLS.items():
+        plot_metric(
+            df_base, df_new,
+            col=col, ylabel=ylabel,
+            title=f"Explanation quality – {ylabel}  [{LABEL_BASELINE} vs {LABEL_NEW}]  ({note})",
+            filename=f"plot_expl_{suffix}.png", out_dir=args.out,
+        )
 
+    # Explanation cost
+    for suffix, (col, ylabel, note) in EXPL_COST_COLS.items():
+        plot_metric(
+            df_base, df_new,
+            col=col, ylabel=ylabel,
+            title=f"Explanation cost – {ylabel}  [{LABEL_BASELINE} vs {LABEL_NEW}]  ({note})",
+            filename=f"plot_expl_{suffix}.png", out_dir=args.out,
+        )
+
+    # Speedup summary
     plot_speedup(df_base, df_new, args.out)
 
     print("\nDone.")
