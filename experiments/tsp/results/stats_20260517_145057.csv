@@ -1,0 +1,4 @@
+mode,instance_name,tsp_file,mzn_file,fzn_file,status,return_code,wall_time_s,AverageBacktrackAmount,AverageConflictSize,AverageLbd,AverageLearnedNogoodLength,NumUnitNogoodsLearned,failures,nodes,nogoods,peakDepth,propagations,propagators,restarts,solveTime,variables
+satisfy,berlin52,experiments\tsp\tsplib\berlin52.tsp,experiments\tsp\instances\berlin52\berlin52.mzn,experiments\tsp\instances\berlin52\berlin52.fzn,timeout,-1,1200.000,,,,,,,,,,,,,,
+satisfy,burma14,experiments\tsp\tsplib\burma14.tsp,experiments\tsp\instances\burma14\burma14.mzn,experiments\tsp\instances\burma14\burma14.fzn,ok,0,24.815,0,13.480808080808082,21.434343434343436,46.660606060606064,0,1980,3550,1980,60,438642,895,0,0.1364171,422
+satisfy,br17,experiments\tsp\tsplib\br17.atsp,experiments\tsp\instances\br17\br17.mzn,experiments\tsp\instances\br17\br17.fzn,ok,0,0.282,0,12,9.9,18.2,0,10,54,10,30,4663,770,0,0.0008952,597

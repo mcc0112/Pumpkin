@@ -15,9 +15,23 @@ Generation procedure:
      leads to an already-visited node, add a fresh random edge to
      an unvisited node; finally close the walk with an edge back to
      the start.
-  5. Write a MiniZinc (.mzn) file matching the tour-design model
-     from Figure 1 of the paper (minimise the longest leg of the
-     circuit, using only edges present in the transport network).
+  5. Write a MiniZinc (.mzn) file asking only for FEASIBILITY:
+     find any Hamiltonian circuit using only edges present in the
+     transport network.  No objective is used, so solver effort
+     reflects propagation behaviour directly.
+
+     Rationale for feasibility over min-cost TSP
+     --------------------------------------------
+     This benchmark suite is designed to study AllDifferent propagator
+     behaviour inside the Circuit constraint in an LCG solver.  Adding
+     a minimisation objective (e.g. minimise total tour length) causes
+     the solver to continue searching after the first solution to prove
+     optimality.  The extra search is driven by cost-bound propagation,
+     not by AllDifferent or Circuit, making it impossible to cleanly
+     attribute differences in node counts / failures / explanation size
+     to the propagator under study.  Pure feasibility stops at the first
+     solution, so every measured quantity directly reflects how well
+     AllDifferent prunes the Circuit search space.
 
 Usage
 -----
@@ -38,13 +52,6 @@ Options
 Output
 ------
 One .mzn file per instance, named  <prefix>_n<N>_k<K>_<index>.mzn
-
-MiniZinc model
---------------
-The generated file is self-contained: it embeds the data and includes
-the circuit constraint predicate inline (no separate include needed).
-It minimises maxleg, the length of the longest leg in the Hamiltonian
-circuit, using only edges present in the transport network.
 """
 
 import argparse
@@ -94,7 +101,6 @@ def k_nearest_edges(
     n = len(dist)
     edges: Set[Tuple[int, int]] = set()
     for i in range(n):
-        # Sort all other nodes by distance to i
         neighbours = sorted(
             (j for j in range(n) if j != i),
             key=lambda j: dist[i][j],
@@ -113,7 +119,7 @@ def random_walk_hamiltonian(
     Perform a random walk on the current adjacency structure to produce
     a Hamiltonian circuit, adding new edges whenever the walk gets stuck.
 
-    Returns the list of extra (directed) edges that were added so the
+    Returns the list of extra (undirected) edges that were added so the
     caller can insert them into the edge set.
     """
     start = rng.randrange(n)
@@ -124,17 +130,13 @@ def random_walk_hamiltonian(
 
     current = start
     while len(path) < n:
-        # Neighbours reachable from current that are still unvisited
         unvisited_neighbours = [v for v in adj[current] if not visited[v]]
 
         if unvisited_neighbours:
-            # Follow a random existing edge to an unvisited node
             nxt = rng.choice(unvisited_neighbours)
         else:
-            # All existing neighbours already visited — add a new edge
             unvisited_all = [v for v in range(n) if not visited[v]]
             nxt = rng.choice(unvisited_all)
-            # Register the new edge in both directions
             adj[current].add(nxt)
             adj[nxt].add(current)
             added_edges.append((min(current, nxt), max(current, nxt)))
@@ -143,7 +145,7 @@ def random_walk_hamiltonian(
         path.append(nxt)
         current = nxt
 
-    # Close the circuit: add edge from last node back to start if not present
+    # Close the circuit
     if start not in adj[current]:
         adj[current].add(start)
         adj[start].add(current)
@@ -161,93 +163,89 @@ def build_graph(
     """
     Build the transport network following Francis & Stuckey Section 3.
 
-    Returns travel_time[i][j]:
-      -1  if no direct connection exists between i and j
-      >=0 the (integer) travel time otherwise
+    Returns allowed[i][j]:
+      False  if no direct connection exists between i and j
+      True   if an edge exists (i.e. j is a valid successor of i)
+
+    Note: distances are no longer written to the MZN file because the
+    feasibility model has no cost objective.  We retain the distance
+    matrix only for k-nearest construction; the output is a plain
+    boolean adjacency structure.
     """
-    # Step 1: k-nearest-neighbour edges
     edge_set = k_nearest_edges(dist, k)
 
-    # Build adjacency sets for the random walk
     adj: List[Set[int]] = [set() for _ in range(n)]
     for (i, j) in edge_set:
         adj[i].add(j)
         adj[j].add(i)
 
-    # Step 2: random walk to guarantee a Hamiltonian circuit
     extra = random_walk_hamiltonian(n, adj, rng)
     edge_set.update(extra)
 
-    # Build the travel_time matrix (-1 = no direct connection)
-    travel_time = [[-1] * n for _ in range(n)]
+    # Boolean adjacency matrix
+    allowed = [[False] * n for _ in range(n)]
     for (i, j) in edge_set:
-        travel_time[i][j] = dist[i][j]
-        travel_time[j][i] = dist[i][j]
+        allowed[i][j] = True
+        allowed[j][i] = True
 
-    return travel_time
+    return allowed, edge_set
 
 
 # ---------------------------------------------------------------------------
-# MiniZinc file writer
+# MiniZinc file writer  –  FEASIBILITY model
 # ---------------------------------------------------------------------------
 
 MZN_TEMPLATE = """\
-%% Tour-design benchmark instance
+%% Circuit-constraint feasibility benchmark instance
 %% Generated by generate_instances.py
 %% Method: Francis & Stuckey (2014) "Explaining circuit propagation"
 %%
+%% Model: pure feasibility -- find any Hamiltonian circuit that uses
+%%        only edges present in the transport network.
+%%        No objective is included so that solver effort (node count,
+%%        failures, explanation size) reflects propagation behaviour
+%%        directly, without interference from cost-bound reasoning.
+%%
 %% Parameters
-%%   n = {n}  (number of locations)
-%%   k = {k}  (nearest-neighbour degree used during generation)
+%%   n    = {n}  (number of locations)
+%%   k    = {k}  (nearest-neighbour degree used during generation)
 %%   seed = {seed}
-%%   scale = {scale}  (distances are Euclidean * scale, rounded to int)
+%%   edges = {num_edges}  (undirected edges in the transport network)
 
 include "circuit.mzn";
 
 int: n = {n};
 set of int: Locations = 1..n;
 
-%% Maximum possible distance (used as upper bound for maxleg)
-int: maxLegLen = {max_leg_len};
-
-%% travel_time[i,j] = travel time from i to j;  -1 means no direct link
-array[Locations, Locations] of int: travelTime = array2d(Locations, Locations, [
-{travel_time_rows}
+%% allowed[i,j] = true iff a direct link exists from i to j
+array[Locations, Locations] of bool: allowed = array2d(Locations, Locations, [
+{allowed_rows}
 ]);
 
 %% Successor variables: succ[i] = next location after i in the tour
 array[Locations] of var Locations: succ;
 
-%% Only use edges that exist in the transport network
-constraint forall(loc1, loc2 in Locations)(
-  travelTime[loc1, loc2] < 0 -> succ[loc1] != loc2
+%% Restrict successors to existing edges only
+constraint forall(i in Locations)(
+  succ[i] in {{j | j in Locations where allowed[i, j]}}
 );
 
 %% Successors must form a Hamiltonian circuit
 constraint circuit(succ);
 
-%% Variable for the length of the longest leg
-var 1..maxLegLen: maxleg;
-
-%% maxleg >= travel time of every used leg
-constraint forall(loc1, loc2 in Locations)(
-  succ[loc1] == loc2 -> maxleg >= travelTime[loc1, loc2]
-);
-
-solve minimize maxleg;
+solve satisfy;
 
 output [
-  "succ = ", show(succ), "\\n",
-  "maxleg = ", show(maxleg), "\\n"
+  "succ = ", show(succ), "\\n"
 ];
 """
 
 
-def format_travel_time(travel_time: List[List[int]], n: int) -> str:
-    """Format the 2-D travel-time array as a flat MiniZinc array literal."""
+def format_allowed(allowed: List[List[bool]], n: int) -> str:
+    """Format the 2-D boolean adjacency matrix as a flat MiniZinc literal."""
     lines = []
     for i in range(n):
-        row = ", ".join(str(travel_time[i][j]) for j in range(n))
+        row = ", ".join("true" if allowed[i][j] else "false" for j in range(n))
         comma = "," if i < n - 1 else ""
         lines.append(f"  {row}{comma}  %% from location {i + 1}")
     return "\n".join(lines)
@@ -258,26 +256,17 @@ def write_mzn(
     n: int,
     k: int,
     seed: int,
-    scale: int,
-    travel_time: List[List[int]],
+    allowed: List[List[bool]],
+    num_edges: int,
 ) -> None:
-    # Largest finite travel time as the upper bound for maxleg
-    max_leg_len = max(
-        travel_time[i][j]
-        for i in range(n)
-        for j in range(n)
-        if travel_time[i][j] >= 0
-    )
-
-    travel_time_rows = format_travel_time(travel_time, n)
+    allowed_rows = format_allowed(allowed, n)
 
     content = MZN_TEMPLATE.format(
         n=n,
         k=k,
         seed=seed,
-        scale=scale,
-        max_leg_len=max_leg_len,
-        travel_time_rows=travel_time_rows,
+        num_edges=num_edges,
+        allowed_rows=allowed_rows,
     )
 
     with open(filepath, "w") as fh:
@@ -291,7 +280,7 @@ def write_mzn(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Generate circuit-constraint benchmark instances "
+            "Generate circuit-constraint feasibility benchmark instances "
             "(Francis & Stuckey 2014 method) and write MiniZinc files."
         ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
@@ -318,20 +307,15 @@ def generate_instance(
     k: int,
     seed: int,
     scale: int,
-) -> List[List[int]]:
-    """Generate one instance and return its travel_time matrix."""
+) -> tuple:
+    """Generate one instance and return (allowed matrix, edge count)."""
     rng = random.Random(seed)
 
-    # Random locations in the unit square
     coords = [(rng.random(), rng.random()) for _ in range(n)]
-
-    # Integer distance matrix
     dist = build_distance_matrix(coords, scale)
+    allowed, edge_set = build_graph(n, k, dist, rng)
 
-    # Transport network with guaranteed Hamiltonian circuit
-    travel_time = build_graph(n, k, dist, rng)
-
-    return travel_time
+    return allowed, len(edge_set)
 
 
 def main() -> None:
@@ -339,18 +323,17 @@ def main() -> None:
 
     os.makedirs(args.outdir, exist_ok=True)
 
-    # Determine the base seed
     base_seed = args.seed if args.seed is not None else random.randrange(2 ** 32)
 
-    print(f"Generating {args.count} instance(s):")
+    print(f"Generating {args.count} feasibility instance(s):")
     print(f"  n={args.nodes}, k={args.neighbours}, scale={args.scale}")
     print(f"  base seed={base_seed}, output dir='{args.outdir}'")
     print()
 
     for idx in range(args.count):
-        seed = base_seed + idx  # deterministic per-instance seed
+        seed = base_seed + idx
 
-        travel_time = generate_instance(
+        allowed, num_edges = generate_instance(
             n=args.nodes,
             k=args.neighbours,
             seed=seed,
@@ -367,18 +350,11 @@ def main() -> None:
             n=args.nodes,
             k=args.neighbours,
             seed=seed,
-            scale=args.scale,
-            travel_time=travel_time,
+            allowed=allowed,
+            num_edges=num_edges,
         )
 
-        # Count edges for a quick sanity-check summary
-        edges = sum(
-            1
-            for i in range(args.nodes)
-            for j in range(i + 1, args.nodes)
-            if travel_time[i][j] >= 0
-        )
-        print(f"  [{idx:4d}] seed={seed:10d}  edges={edges:5d}  -> {filepath}")
+        print(f"  [{idx:4d}] seed={seed:10d}  edges={num_edges:5d}  -> {filepath}")
 
     print("\nDone.")
 
