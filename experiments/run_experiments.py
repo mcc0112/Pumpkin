@@ -139,6 +139,7 @@ def convert_to_fzn(mzn_path: Path) -> Path | None:
         "minizinc",
         "--solver", "pumpkin",
         "-c",                     # compile only (produce FlatZinc)
+        "--no-output-ozn",
         str(rel_mzn),
     ]
     print(f"    [mzn→fzn] {rel_mzn.name}", end="  ")
