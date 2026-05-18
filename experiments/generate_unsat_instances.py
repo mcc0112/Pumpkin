@@ -313,13 +313,13 @@ def main():
         dist = build_distance_matrix(coords, args.scale)
 
         if args.unsat_mode == "random":
-            allowed = build_random_unsat(args.nodes, args.k, dist)
+            allowed = build_random_unsat(args.nodes, args.neighbours, dist)
             if allowed is None:
                 continue   # this seed happened to be SAT-reachable, skip it
             extra = "No Hamiltonicity guarantee (random walk omitted)"
 
         else:  # forced
-            allowed, split = build_forced_unsat(args.nodes, args.k, dist, rng)
+            allowed, split = build_forced_unsat(args.nodes, args.neighbours, dist, rng)
             extra = (
                 f"Forced Hall violation: nodes 1..{split} form isolated group "
                 f"(no outgoing edges to nodes {split+1}..{args.nodes})"
@@ -330,7 +330,7 @@ def main():
             f"_{args.unsat_mode}_{generated:04d}.mzn"
         )
         filepath = os.path.join(args.outdir, filename)
-        write_mzn(filepath, args.nodes, args.k, seed, args.unsat_mode, allowed, extra)
+        write_mzn(filepath, args.nodes, args.neighbours, seed, args.unsat_mode, allowed, extra)
 
         print(
             f"  [{generated:4d}] seed={seed:10d}  attempt={attempt:4d}  "

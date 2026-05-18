@@ -3,35 +3,32 @@ analyse_results.py  –  Two-propagator comparison for circuit benchmark
 =======================================================================
 
 Loads the two most-recent stats_*.csv files from experiments/results/,
-treats the older one as "baseline" and the newer one as "new", then:
+treats the older one as "baseline" and the newer one as "new", then
+produces separate analyses for three instance types:
 
-  • Prints a per-configuration comparison table to the terminal
-  • Writes  experiments/results/comparison_<timestamp>.csv
-  • Saves plots grouped by research dimension:
+  SAT geographic instances   (instance_type == "sat")
+  UNSAT instances            (instance_type == "unsat_random" or "unsat_forced")
+  TSP instances              (detected by presence of "instance_name" column
+                              and absence of "instance_type", or loaded via
+                              --tsp-baseline / --tsp-new)
 
-    Runtime
-      plot_runtime.png               – wall_time_s  (grouped bars + raw dots)
-      plot_runtime_breakdown.png     – initTime vs solveTime  (stacked bars)
-
-    Search reduction
-      plot_search_failures.png       – failures
-      plot_search_nodes.png          – nodes
-      plot_search_propagations.png   – propagations
-      plot_search_peakdepth.png      – peakDepth
-      plot_search_restarts.png       – restarts
-
-    Explanation quality
-      plot_expl_lbd.png              – AverageLbd          (lower = better)
-      plot_expl_nogood_length.png    – AverageLearnedNogoodLength
-      plot_expl_nogoods.png          – nogoods (total learned)
-      plot_expl_unit_nogoods.png     – NumUnitNogoodsLearned
-
-    Explanation cost
-      plot_expl_conflict_size.png    – AverageConflictSize
-      plot_expl_backtrack.png        – AverageBacktrackAmount
-
-    Summary
-      plot_speedup.png               – runtime speedup ratio  baseline / new
+Output structure
+----------------
+  results/
+    comparison_<timestamp>.csv        full numeric table (all types)
+    sat/
+      plot_runtime.png
+      plot_search_failures.png
+      ...
+    unsat_random/
+      plot_runtime.png
+      ...
+    unsat_forced/
+      plot_runtime.png
+      ...
+    tsp/
+      plot_runtime.png
+      ...
 
 Usage (from the Pumpkin project root)
 --------------------------------------
@@ -39,14 +36,12 @@ Usage (from the Pumpkin project root)
 
 Options
 -------
-  --baseline PATH   Explicit path to the baseline CSV
-  --new      PATH   Explicit path to the new-propagator CSV
-  --out      PATH   Output directory  (default: experiments/results/)
-
-Column mapping
---------------
-Edit METRIC_COLS near the top of the file if your solver uses different
-stat names.
+  --baseline      PATH   Explicit path to baseline stats CSV
+  --new           PATH   Explicit path to new-propagator stats CSV
+  --tsp-baseline  PATH   Baseline CSV from run_tsp_experiments.py
+  --tsp-new       PATH   New-propagator CSV from run_tsp_experiments.py
+  --out           PATH   Output directory  (default: experiments/results/)
+  --no-plots             Skip plot generation (table only)
 """
 
 import argparse
@@ -57,7 +52,7 @@ from pathlib import Path
 try:
     import pandas as pd
 except ImportError:
-    sys.exit("pandas is required:  uv add pandas")
+    sys.exit("pandas is required:  pip install pandas")
 
 try:
     import matplotlib.pyplot as plt
@@ -65,71 +60,51 @@ try:
     import numpy as np
     HAS_MPL = True
 except ImportError:
-    print("matplotlib/numpy not found – skipping plots (uv add matplotlib)")
+    print("matplotlib/numpy not found – skipping plots")
     HAS_MPL = False
 
 # ---------------------------------------------------------------------------
-# Configuration – edit these if your solver emits different stat names
+# Metric definitions
 # ---------------------------------------------------------------------------
 
-# All metrics, grouped by research dimension.
-# Format: { "Human-readable label": "csv_column_name" }
-
 METRIC_COLS: dict[str, str] = {
-    # --- Runtime ---
-    "Wall-clock time (s)"               : "wall_time_s",
-    "Init time (s)"                     : "initTime",
-    "Solve time (s)"                    : "solveTime",
-
-    # --- Search reduction ---
-    "Failures (backtracks)"             : "failures",
-    "Nodes explored"                    : "nodes",
-    "Propagations"                      : "propagations",
-    "Peak depth"                        : "peakDepth",
-    "Restarts"                          : "restarts",
-
-    # --- Explanation quality ---
-    "Average LBD"                       : "AverageLbd",
-    "Avg learned nogood length"         : "AverageLearnedNogoodLength",
-    "Nogoods learned (total)"           : "nogoods",
-    "Unit nogoods learned"              : "NumUnitNogoodsLearned",
-
-    # --- Explanation cost ---
-    "Average conflict size"             : "AverageConflictSize",
-    "Average backtrack amount"          : "AverageBacktrackAmount",
+    "Wall-clock time (s)"           : "wall_time_s",
+    "Solve time (s)"                : "solveTime",
+    "Failures (backtracks)"         : "failures",
+    "Nodes explored"                : "nodes",
+    "Propagations"                  : "propagations",
+    "Peak depth"                    : "peakDepth",
+    "Restarts"                      : "restarts",
+    "Average LBD"                   : "AverageLbd",
+    "Avg learned nogood length"     : "AverageLearnedNogoodLength",
+    "Nogoods learned (total)"       : "nogoods",
+    "Unit nogoods learned"          : "NumUnitNogoodsLearned",
+    "Average conflict size"         : "AverageConflictSize",
+    "Average backtrack amount"      : "AverageBacktrackAmount",
 }
 
-# Columns used for dedicated plots
-RUNTIME_COL          = "wall_time_s"
-INIT_COL             = "initTime"
-SOLVE_COL            = "solveTime"
+RUNTIME_COL  = "solveTime"   # primary runtime metric (no Cargo noise)
+WALL_COL     = "wall_time_s"
 
 SEARCH_COLS: dict[str, tuple[str, str, str]] = {
-    # filename_suffix       : (csv_col,            ylabel,                        "lower/higher is better" note)
-    "failures"   : ("failures",             "Mean failures (backtracks)",   "lower is better"),
-    "nodes"      : ("nodes",                "Mean nodes explored",          "lower is better"),
-    "propagations": ("propagations",        "Mean propagations",            "lower is better"),
-    "peakdepth"  : ("peakDepth",            "Mean peak search depth",       "lower is better"),
-    "restarts"   : ("restarts",             "Mean restarts",                "informational"),
+    "failures"    : ("failures",    "Mean failures (backtracks)",  "lower is better"),
+    "nodes"       : ("nodes",       "Mean nodes explored",         "lower is better"),
+    "propagations": ("propagations","Mean propagations",           "lower is better"),
+    "peakdepth"   : ("peakDepth",   "Mean peak search depth",      "informational"),
+    "restarts"    : ("restarts",    "Mean restarts",               "informational"),
 }
 
-EXPL_QUALITY_COLS: dict[str, tuple[str, str, str]] = {
-    "lbd"           : ("AverageLbd",                 "Mean average LBD",                     "lower = stronger"),
-    "nogood_length" : ("AverageLearnedNogoodLength",  "Mean avg learned nogood length",       "lower = stronger"),
-    "nogoods"       : ("nogoods",                    "Mean nogoods learned (total)",          "informational"),
-    "unit_nogoods"  : ("NumUnitNogoodsLearned",       "Mean unit nogoods learned",            "higher = stronger"),
+EXPL_COLS: dict[str, tuple[str, str, str]] = {
+    "lbd"           : ("AverageLbd",                "Mean average LBD",              "lower = stronger"),
+    "nogood_length" : ("AverageLearnedNogoodLength", "Mean avg nogood length",        "lower = stronger"),
+    "nogoods"       : ("nogoods",                   "Mean nogoods learned (total)",  "informational"),
+    "unit_nogoods"  : ("NumUnitNogoodsLearned",      "Mean unit nogoods learned",     "higher = stronger"),
+    "conflict_size" : ("AverageConflictSize",        "Mean average conflict size",    "lower = cheaper"),
 }
 
-EXPL_COST_COLS: dict[str, tuple[str, str, str]] = {
-    "conflict_size" : ("AverageConflictSize",         "Mean average conflict size",           "lower = cheaper"),
-    "backtrack"     : ("AverageBacktrackAmount",       "Mean average backtrack amount",        "lower = cheaper"),
-}
-
-LABEL_BASELINE   = "baseline"
-LABEL_NEW        = "new"
-COLORS           = {LABEL_BASELINE: "#4C72B0", LABEL_NEW: "#DD8452"}
-
-GROUP_KEYS       = ["config_n", "config_k"]
+LABEL_BASELINE = "baseline"
+LABEL_NEW      = "new"
+COLORS         = {LABEL_BASELINE: "#4C72B0", LABEL_NEW: "#DD8452"}
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -137,26 +112,21 @@ GROUP_KEYS       = ["config_n", "config_k"]
 SCRIPT_DIR  = Path(__file__).parent
 RESULTS_DIR = SCRIPT_DIR / "results"
 
-
 # ---------------------------------------------------------------------------
 # File discovery
 # ---------------------------------------------------------------------------
 
 def two_latest_csvs(results_dir: Path) -> tuple[Path, Path]:
-    """Return (older, newer) of the two most-recent stats_*.csv files."""
     csvs = sorted(results_dir.glob("stats_*.csv"))
     if len(csvs) < 2:
         sys.exit(
-            f"Need at least 2 stats_*.csv files in {results_dir}, "
-            f"found {len(csvs)}.\n"
-            "Run the experiments with both propagators first, or pass "
-            "--baseline and --new explicitly."
+            f"Need at least 2 stats_*.csv files in {results_dir}, found {len(csvs)}.\n"
+            "Pass --baseline and --new explicitly if files are elsewhere."
         )
     return csvs[-2], csvs[-1]
 
-
 # ---------------------------------------------------------------------------
-# Loading
+# Loading & splitting
 # ---------------------------------------------------------------------------
 
 def _coerce_numerics(df: pd.DataFrame) -> pd.DataFrame:
@@ -171,230 +141,195 @@ def load(csv_path: Path, label: str) -> pd.DataFrame:
     df = pd.read_csv(csv_path)
     df = _coerce_numerics(df)
     df["propagator"] = label
+    # If no instance_type column exists, infer from columns present
+    if "instance_type" not in df.columns:
+        if "instance_name" in df.columns:
+            df["instance_type"] = "tsp"
+        else:
+            df["instance_type"] = "sat"
     print(f"  [{label:>8}]  {len(df)} rows  ←  {csv_path.name}")
+    if "instance_type" in df.columns:
+        for t, grp in df.groupby("instance_type"):
+            print(f"              {len(grp):>4} rows  instance_type={t}")
     return df
 
 
+def split_by_type(
+    df_base: pd.DataFrame,
+    df_new: pd.DataFrame,
+) -> dict[str, tuple[pd.DataFrame, pd.DataFrame]]:
+    """
+    Return a dict mapping instance_type -> (df_base_subset, df_new_subset).
+    Only returns types that have data in both dataframes.
+    """
+    types_base = set(df_base["instance_type"].unique())
+    types_new  = set(df_new["instance_type"].unique())
+    common     = types_base & types_new
+
+    result = {}
+    for t in sorted(common):
+        b = df_base[df_base["instance_type"] == t].copy()
+        n = df_new[df_new["instance_type"] == t].copy()
+        if len(b) > 0 and len(n) > 0:
+            result[t] = (b, n)
+    return result
+
 # ---------------------------------------------------------------------------
-# Aggregation helpers
+# Aggregation
 # ---------------------------------------------------------------------------
 
-def config_label(n: int | float, k: int | float) -> str:
+def config_label_geo(n, k) -> str:
     return f"n={int(n)}, k={int(k)}"
 
 
-def mean_per_config(df: pd.DataFrame, col: str) -> pd.Series:
+def mean_per_geo_config(df: pd.DataFrame, col: str) -> pd.Series:
     ok = df[df["status"] == "ok"] if "status" in df.columns else df
     if col not in ok.columns:
         return pd.Series(dtype=float)
-    return ok.groupby(GROUP_KEYS)[col].mean()
+    return ok.groupby(["config_n", "config_k"])[col].mean()
 
 
-def raw_per_config(df: pd.DataFrame, col: str) -> dict[tuple, list[float]]:
+def raw_per_geo_config(df: pd.DataFrame, col: str) -> dict:
     ok = df[df["status"] == "ok"] if "status" in df.columns else df
     if col not in ok.columns:
         return {}
-    result: dict[tuple, list[float]] = {}
-    for cfg, grp in ok.groupby(GROUP_KEYS):
+    result = {}
+    for cfg, grp in ok.groupby(["config_n", "config_k"]):
         vals = grp[col].dropna().tolist()
         if vals:
             result[cfg] = vals
     return result
 
 
+def mean_per_tsp_instance(df: pd.DataFrame, col: str) -> pd.Series:
+    ok = df[df["status"] == "ok"] if "status" in df.columns else df
+    if col not in ok.columns or "instance_name" not in ok.columns:
+        return pd.Series(dtype=float)
+    return ok.groupby("instance_name")[col].mean()
+
 # ---------------------------------------------------------------------------
-# Comparison table
+# Comparison table builder (works for both geo and TSP)
 # ---------------------------------------------------------------------------
 
 def build_comparison_table(
     df_base: pd.DataFrame,
     df_new:  pd.DataFrame,
+    instance_type: str,
 ) -> pd.DataFrame:
     rows = []
+    is_tsp = (instance_type == "tsp")
+
     for display_name, col in METRIC_COLS.items():
-        base_means = mean_per_config(df_base, col)
-        new_means  = mean_per_config(df_new,  col)
-        all_configs = sorted(base_means.index.union(new_means.index))
-
-        for cfg in all_configs:
-            b = base_means.get(cfg, float("nan"))
-            n = new_means.get(cfg,  float("nan"))
-            abs_diff = n - b
-            rel_diff = (abs_diff / b * 100) if (b and b != 0) else float("nan")
-            rows.append({
-                "metric"                         : display_name,
-                "config_n"                       : cfg[0],
-                "config_k"                       : cfg[1],
-                "config"                         : config_label(*cfg),
-                f"{LABEL_BASELINE}_mean"         : round(b, 4),
-                f"{LABEL_NEW}_mean"              : round(n, 4),
-                "abs_diff"                       : round(abs_diff, 4),
-                "rel_diff_%"                     : round(rel_diff, 2),
-            })
+        if is_tsp:
+            base_means = mean_per_tsp_instance(df_base, col)
+            new_means  = mean_per_tsp_instance(df_new,  col)
+            all_configs = sorted(base_means.index.union(new_means.index))
+            for cfg in all_configs:
+                b = base_means.get(cfg, float("nan"))
+                n = new_means.get(cfg,  float("nan"))
+                diff = n - b
+                rel  = (diff / b * 100) if (b and b != 0) else float("nan")
+                rows.append({
+                    "metric"         : display_name,
+                    "instance_type"  : instance_type,
+                    "instance"       : cfg,
+                    "baseline_mean"  : round(b, 4),
+                    "new_mean"       : round(n, 4),
+                    "abs_diff"       : round(diff, 4),
+                    "rel_diff_%"     : round(rel, 2),
+                })
+        else:
+            base_means = mean_per_geo_config(df_base, col)
+            new_means  = mean_per_geo_config(df_new,  col)
+            all_configs = sorted(base_means.index.union(new_means.index))
+            for cfg in all_configs:
+                b = base_means.get(cfg, float("nan"))
+                n = new_means.get(cfg,  float("nan"))
+                diff = n - b
+                rel  = (diff / b * 100) if (b and b != 0) else float("nan")
+                rows.append({
+                    "metric"         : display_name,
+                    "instance_type"  : instance_type,
+                    "config_n"       : cfg[0],
+                    "config_k"       : cfg[1],
+                    "config"         : config_label_geo(*cfg),
+                    "baseline_mean"  : round(b, 4),
+                    "new_mean"       : round(n, 4),
+                    "abs_diff"       : round(diff, 4),
+                    "rel_diff_%"     : round(rel, 2),
+                })
     return pd.DataFrame(rows)
-
 
 # ---------------------------------------------------------------------------
 # Plotting helpers
 # ---------------------------------------------------------------------------
 
-def _grouped_bar_with_points(
-    ax: "plt.Axes",
-    configs: list[str],
-    base_vals: list[float],
-    new_vals:  list[float],
-    base_raw:  dict[tuple, list[float]],
-    new_raw:   dict[tuple, list[float]],
-    all_configs: list[tuple],
-    ylabel: str,
-    title:  str,
-) -> None:
+def _grouped_bar_with_points(ax, configs, base_vals, new_vals,
+                              base_raw, new_raw, all_configs, ylabel, title):
     x     = np.arange(len(configs))
     width = 0.35
     rng   = np.random.default_rng(seed=0)
 
-    ax.bar(x - width / 2, base_vals, width,
-           label=LABEL_BASELINE, color=COLORS[LABEL_BASELINE], alpha=0.82, zorder=2)
-    ax.bar(x + width / 2, new_vals,  width,
-           label=LABEL_NEW,      color=COLORS[LABEL_NEW],      alpha=0.82, zorder=2)
+    ax.bar(x - width/2, base_vals, width, label=LABEL_BASELINE,
+           color=COLORS[LABEL_BASELINE], alpha=0.82, zorder=2)
+    ax.bar(x + width/2, new_vals,  width, label=LABEL_NEW,
+           color=COLORS[LABEL_NEW],      alpha=0.82, zorder=2)
 
     for i, cfg in enumerate(all_configs):
-        for offset, raw_dict in [(-width / 2, base_raw), (+width / 2, new_raw)]:
+        for offset, raw_dict in [(-width/2, base_raw), (+width/2, new_raw)]:
             pts = raw_dict.get(cfg, [])
             if pts:
                 jitter = rng.uniform(-0.07, 0.07, len(pts))
-                ax.scatter(
-                    np.full(len(pts), x[i] + offset) + jitter, pts,
-                    color="black", s=20, alpha=0.5, zorder=3,
-                )
+                ax.scatter(np.full(len(pts), x[i] + offset) + jitter, pts,
+                           color="black", s=20, alpha=0.5, zorder=3)
 
     ax.set_xticks(x)
-    ax.set_xticklabels(configs, fontsize=8)
+    ax.set_xticklabels(configs, fontsize=8, rotation=30, ha="right")
     ax.set_ylabel(ylabel)
-    ax.set_title(title)
+    ax.set_title(title, fontsize=10)
     ax.legend()
     ax.grid(axis="y", linestyle="--", alpha=0.45, zorder=0)
     ax.yaxis.set_minor_locator(mticker.AutoMinorLocator())
 
 
-def _save(fig: "plt.Figure", path: Path) -> None:
+def _save(fig, path: Path) -> None:
     fig.tight_layout()
     fig.savefig(path, dpi=150)
-    print(f"  Saved: {path}")
+    print(f"    Saved: {path.name}")
     plt.close(fig)
 
-
 # ---------------------------------------------------------------------------
-# Generic metric plot
+# Geographic (SAT / UNSAT) plots
 # ---------------------------------------------------------------------------
 
-def plot_metric(
-    df_base: pd.DataFrame,
-    df_new:  pd.DataFrame,
-    col:      str,
-    ylabel:   str,
-    title:    str,
-    filename: str,
-    out_dir:  Path,
-) -> None:
-    base_means = mean_per_config(df_base, col)
-    new_means  = mean_per_config(df_new,  col)
-
+def plot_geo_metric(df_base, df_new, col, ylabel, title, filename, out_dir):
+    base_means = mean_per_geo_config(df_base, col)
+    new_means  = mean_per_geo_config(df_new,  col)
     if base_means.empty and new_means.empty:
-        print(f"  Column '{col}' not found in either file – skipping {filename}")
+        print(f"    Column '{col}' not found – skipping {filename}")
         return
 
     all_configs = sorted(base_means.index.union(new_means.index))
-    labels  = [config_label(*c) for c in all_configs]
-    b_vals  = [float(base_means.get(c, 0)) for c in all_configs]
-    n_vals  = [float(new_means.get(c,  0)) for c in all_configs]
-    base_raw = raw_per_config(df_base, col)
-    new_raw  = raw_per_config(df_new,  col)
+    labels   = [config_label_geo(*c) for c in all_configs]
+    b_vals   = [float(base_means.get(c, 0)) for c in all_configs]
+    n_vals   = [float(new_means.get(c,  0)) for c in all_configs]
+    base_raw = raw_per_geo_config(df_base, col)
+    new_raw  = raw_per_geo_config(df_new,  col)
 
-    fig, ax = plt.subplots(figsize=(max(7, len(labels) * 1.05), 5))
-    _grouped_bar_with_points(
-        ax, labels, b_vals, n_vals,
-        base_raw, new_raw, all_configs,
-        ylabel, title,
-    )
+    fig, ax = plt.subplots(figsize=(max(7, len(labels) * 1.1), 5))
+    _grouped_bar_with_points(ax, labels, b_vals, n_vals,
+                             base_raw, new_raw, all_configs, ylabel, title)
     _save(fig, out_dir / filename)
 
 
-# ---------------------------------------------------------------------------
-# Runtime breakdown: stacked bar  initTime + solveTime
-# ---------------------------------------------------------------------------
-
-def plot_runtime_breakdown(
-    df_base: pd.DataFrame,
-    df_new:  pd.DataFrame,
-    out_dir: Path,
-) -> None:
-    """
-    Stacked bar: initTime (hatched) + solveTime (solid) for each config.
-    Helps reveal whether matching-based approach pays higher init cost.
-    """
-    init_b  = mean_per_config(df_base, INIT_COL)
-    solve_b = mean_per_config(df_base, SOLVE_COL)
-    init_n  = mean_per_config(df_new,  INIT_COL)
-    solve_n = mean_per_config(df_new,  SOLVE_COL)
-
-    if init_b.empty and solve_b.empty:
-        print(f"  Columns '{INIT_COL}'/'{SOLVE_COL}' not found – skipping runtime breakdown")
-        return
-
-    all_configs = sorted(
-        init_b.index.union(solve_b.index).union(init_n.index).union(solve_n.index)
-    )
-    labels  = [config_label(*c) for c in all_configs]
-    x       = np.arange(len(labels))
-    width   = 0.35
-
-    ib = [float(init_b.get(c,  0)) for c in all_configs]
-    sb = [float(solve_b.get(c, 0)) for c in all_configs]
-    in_ = [float(init_n.get(c,  0)) for c in all_configs]
-    sn  = [float(solve_n.get(c, 0)) for c in all_configs]
-
-    fig, ax = plt.subplots(figsize=(max(7, len(labels) * 1.05), 5))
-
-    ax.bar(x - width / 2, ib, width, label=f"{LABEL_BASELINE} – init",
-           color=COLORS[LABEL_BASELINE], alpha=0.5, hatch="//", zorder=2)
-    ax.bar(x - width / 2, sb, width, bottom=ib, label=f"{LABEL_BASELINE} – solve",
-           color=COLORS[LABEL_BASELINE], alpha=0.85, zorder=2)
-
-    ax.bar(x + width / 2, in_, width, label=f"{LABEL_NEW} – init",
-           color=COLORS[LABEL_NEW], alpha=0.5, hatch="//", zorder=2)
-    ax.bar(x + width / 2, sn,  width, bottom=in_, label=f"{LABEL_NEW} – solve",
-           color=COLORS[LABEL_NEW], alpha=0.85, zorder=2)
-
-    ax.set_xticks(x)
-    ax.set_xticklabels(labels, fontsize=8)
-    ax.set_ylabel("Mean time (s)")
-    ax.set_title(
-        f"Runtime breakdown  [{LABEL_BASELINE} vs {LABEL_NEW}]\n"
-        "Hatched = init time,  Solid = solve time"
-    )
-    ax.legend(fontsize=8)
-    ax.grid(axis="y", linestyle="--", alpha=0.45, zorder=0)
-    _save(fig, out_dir / "plot_runtime_breakdown.png")
-
-
-# ---------------------------------------------------------------------------
-# Speedup summary
-# ---------------------------------------------------------------------------
-
-def plot_speedup(
-    df_base: pd.DataFrame,
-    df_new:  pd.DataFrame,
-    out_dir: Path,
-) -> None:
-    base_means = mean_per_config(df_base, RUNTIME_COL)
-    new_means  = mean_per_config(df_new,  RUNTIME_COL)
+def plot_geo_speedup(df_base, df_new, out_dir, title_suffix=""):
+    base_means = mean_per_geo_config(df_base, RUNTIME_COL)
+    new_means  = mean_per_geo_config(df_new,  RUNTIME_COL)
     if base_means.empty:
-        print("  No runtime data for speedup plot – skipping.")
         return
 
     all_configs = sorted(base_means.index.union(new_means.index))
-    labels   = [config_label(*c) for c in all_configs]
+    labels   = [config_label_geo(*c) for c in all_configs]
     speedups = []
     for c in all_configs:
         b = float(base_means.get(c, float("nan")))
@@ -406,119 +341,231 @@ def plot_speedup(
         for s in speedups
     ]
 
-    fig, ax = plt.subplots(figsize=(6, max(4, len(labels) * 0.6)))
+    fig, ax = plt.subplots(figsize=(6, max(4, len(labels) * 0.55)))
     y = np.arange(len(labels))
     ax.barh(y, speedups, color=bar_colors, alpha=0.85)
-    ax.axvline(1.0, color="black", linewidth=1.4, linestyle="--",
-               label="no change  (speedup = 1)")
+    ax.axvline(1.0, color="black", linewidth=1.4, linestyle="--", label="no change")
     ax.set_yticks(y)
     ax.set_yticklabels(labels, fontsize=8)
-    ax.set_xlabel(f"Speedup  ({LABEL_BASELINE} time / {LABEL_NEW} time)")
+    ax.set_xlabel(f"Speedup  (baseline solveTime / new solveTime)")
     ax.set_title(
-        f"Runtime speedup of  '{LABEL_NEW}'  over  '{LABEL_BASELINE}'\n"
-        f"Blue = new is slower,  Orange = new is faster"
+        f"Runtime speedup  '{LABEL_NEW}' over '{LABEL_BASELINE}'{title_suffix}\n"
+        "Blue = new is slower,  Orange = new is faster"
     )
     ax.legend(fontsize=8)
     ax.grid(axis="x", linestyle="--", alpha=0.45)
     _save(fig, out_dir / "plot_speedup.png")
 
+# ---------------------------------------------------------------------------
+# TSP plots  (x-axis = instance name, not (n,k))
+# ---------------------------------------------------------------------------
+
+def plot_tsp_metric(df_base, df_new, col, ylabel, title, filename, out_dir):
+    base_means = mean_per_tsp_instance(df_base, col)
+    new_means  = mean_per_tsp_instance(df_new,  col)
+    if base_means.empty and new_means.empty:
+        print(f"    Column '{col}' not found – skipping {filename}")
+        return
+
+    all_instances = sorted(base_means.index.union(new_means.index))
+    b_vals = [float(base_means.get(i, 0)) for i in all_instances]
+    n_vals = [float(new_means.get(i,  0)) for i in all_instances]
+
+    x     = np.arange(len(all_instances))
+    width = 0.35
+    fig, ax = plt.subplots(figsize=(max(6, len(all_instances) * 1.1), 5))
+    ax.bar(x - width/2, b_vals, width, label=LABEL_BASELINE,
+           color=COLORS[LABEL_BASELINE], alpha=0.82)
+    ax.bar(x + width/2, n_vals, width, label=LABEL_NEW,
+           color=COLORS[LABEL_NEW], alpha=0.82)
+    ax.set_xticks(x)
+    ax.set_xticklabels(all_instances, fontsize=9, rotation=25, ha="right")
+    ax.set_ylabel(ylabel)
+    ax.set_title(title, fontsize=10)
+    ax.legend()
+    ax.grid(axis="y", linestyle="--", alpha=0.45)
+    _save(fig, out_dir / filename)
+
+
+def plot_tsp_speedup(df_base, df_new, out_dir):
+    base_means = mean_per_tsp_instance(df_base, RUNTIME_COL)
+    new_means  = mean_per_tsp_instance(df_new,  RUNTIME_COL)
+    if base_means.empty:
+        return
+
+    all_instances = sorted(base_means.index.union(new_means.index))
+    speedups = []
+    for i in all_instances:
+        b = float(base_means.get(i, float("nan")))
+        n = float(new_means.get(i,  float("nan")))
+        speedups.append(b / n if (n and n != 0) else float("nan"))
+
+    bar_colors = [
+        COLORS[LABEL_NEW] if (not np.isnan(s) and s >= 1) else COLORS[LABEL_BASELINE]
+        for s in speedups
+    ]
+
+    fig, ax = plt.subplots(figsize=(5, max(3, len(all_instances) * 0.55)))
+    y = np.arange(len(all_instances))
+    ax.barh(y, speedups, color=bar_colors, alpha=0.85)
+    ax.axvline(1.0, color="black", linewidth=1.4, linestyle="--", label="no change")
+    ax.set_yticks(y)
+    ax.set_yticklabels(all_instances, fontsize=9)
+    ax.set_xlabel("Speedup  (baseline / new)")
+    ax.set_title("TSP runtime speedup\nBlue = new slower,  Orange = new faster")
+    ax.legend(fontsize=8)
+    ax.grid(axis="x", linestyle="--", alpha=0.45)
+    _save(fig, out_dir / "plot_speedup.png")
+
+# ---------------------------------------------------------------------------
+# Full section runner
+# ---------------------------------------------------------------------------
+
+def run_section(
+    df_base: pd.DataFrame,
+    df_new:  pd.DataFrame,
+    instance_type: str,
+    out_dir: Path,
+    all_tables: list,
+) -> None:
+    """Generate all plots and table rows for one instance_type section."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    is_tsp = (instance_type == "tsp")
+
+    print(f"\n{'='*60}")
+    print(f"  Section: {instance_type.upper()}  ({len(df_base)} baseline rows)")
+    print(f"  Output:  {out_dir}")
+    print(f"{'='*60}")
+
+    # --- Comparison table ---
+    table = build_comparison_table(df_base, df_new, instance_type)
+    all_tables.append(table)
+
+    for metric, grp in table.groupby("metric", sort=False):
+        val_col = "instance" if is_tsp else "config"
+        if val_col in grp.columns:
+            print(f"\n  ── {metric} ──")
+            print(
+                grp[[val_col, "baseline_mean", "new_mean", "abs_diff", "rel_diff_%"]]
+                .to_string(index=False)
+            )
+
+    if not HAS_MPL:
+        return
+
+    plot_fn      = plot_tsp_metric    if is_tsp else plot_geo_metric
+    speedup_fn   = plot_tsp_speedup   if is_tsp else plot_geo_speedup
+
+    type_label = f"  [{instance_type}]"
+
+    # Runtime
+    plot_fn(df_base, df_new,
+            col=RUNTIME_COL, ylabel="Mean solve time (s)",
+            title=f"Solve time{type_label}  [{LABEL_BASELINE} vs {LABEL_NEW}]",
+            filename="plot_runtime_solve.png", out_dir=out_dir)
+
+    plot_fn(df_base, df_new,
+            col=WALL_COL, ylabel="Mean wall-clock time (s)",
+            title=f"Wall-clock time{type_label}  [{LABEL_BASELINE} vs {LABEL_NEW}]",
+            filename="plot_runtime_wall.png", out_dir=out_dir)
+
+    # Search reduction
+    for suffix, (col, ylabel, note) in SEARCH_COLS.items():
+        plot_fn(df_base, df_new,
+                col=col, ylabel=ylabel,
+                title=f"{ylabel}{type_label}  ({note})",
+                filename=f"plot_search_{suffix}.png", out_dir=out_dir)
+
+    # Explanation quality
+    for suffix, (col, ylabel, note) in EXPL_COLS.items():
+        plot_fn(df_base, df_new,
+                col=col, ylabel=ylabel,
+                title=f"{ylabel}{type_label}  ({note})",
+                filename=f"plot_expl_{suffix}.png", out_dir=out_dir)
+
+    # Speedup
+    title_suffix = f"  [{instance_type}]" if not is_tsp else ""
+    if is_tsp:
+        speedup_fn(df_base, df_new, out_dir)
+    else:
+        speedup_fn(df_base, df_new, out_dir, title_suffix=title_suffix)
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
-def parse_args() -> argparse.Namespace:
+def parse_args():
     p = argparse.ArgumentParser(
-        description="Compare two circuit-propagator benchmark runs.",
+        description="Compare two circuit-propagator benchmark runs, split by instance type.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    p.add_argument("--baseline", type=Path, default=None)
-    p.add_argument("--new",      type=Path, default=None)
-    p.add_argument("--out",      type=Path, default=RESULTS_DIR)
+    p.add_argument("--baseline",     type=Path, default=None,
+                   help="Baseline stats CSV (geographic + UNSAT instances)")
+    p.add_argument("--new",          type=Path, default=None,
+                   help="New-propagator stats CSV")
+    p.add_argument("--tsp-baseline", type=Path, default=None,
+                   help="Baseline CSV from run_tsp_experiments.py")
+    p.add_argument("--tsp-new",      type=Path, default=None,
+                   help="New-propagator CSV from run_tsp_experiments.py")
+    p.add_argument("--out",          type=Path, default=RESULTS_DIR)
+    p.add_argument("--no-plots",     action="store_true")
     return p.parse_args()
 
 
-def main() -> None:
+def main():
     args = parse_args()
 
+    if args.no_plots:
+        global HAS_MPL
+        HAS_MPL = False
+
+    # ---- Load geographic/UNSAT CSVs (optional if TSP-only run) -------------
+    print("\nLoading CSVs:")
+    df_base = pd.DataFrame()
+    df_new  = pd.DataFrame()
+
     if args.baseline and args.new:
-        path_base, path_new = args.baseline, args.new
+        df_base = load(args.baseline, LABEL_BASELINE)
+        df_new  = load(args.new,      LABEL_NEW)
     elif args.baseline or args.new:
-        sys.exit("Provide both --baseline and --new, or neither (auto-detect).")
-    else:
+        sys.exit("Provide both --baseline and --new, or neither.")
+    elif not (args.tsp_baseline and args.tsp_new):
+        # No explicit files at all — try auto-detect from results dir
         path_base, path_new = two_latest_csvs(RESULTS_DIR)
+        df_base = load(path_base, LABEL_BASELINE)
+        df_new  = load(path_new,  LABEL_NEW)
+    else:
+        print("  No geographic CSVs provided — running TSP-only analysis.")
 
-    print(f"\nPropagator comparison")
-    print(f"  {LABEL_BASELINE:>8} ←  {path_base}")
-    print(f"  {LABEL_NEW:>8} ←  {path_new}\n")
-    print("Loading CSVs:")
-    df_base = load(path_base, LABEL_BASELINE)
-    df_new  = load(path_new,  LABEL_NEW)
+    # ---- Optionally load TSP CSVs ------------------------------------------
+    if args.tsp_baseline and args.tsp_new:
+        df_tsp_base = load(args.tsp_baseline, LABEL_BASELINE)
+        df_tsp_new  = load(args.tsp_new,      LABEL_NEW)
+        df_tsp_base["instance_type"] = "tsp"
+        df_tsp_new["instance_type"]  = "tsp"
+        df_base = pd.concat([df_base, df_tsp_base], ignore_index=True)
+        df_new  = pd.concat([df_new,  df_tsp_new],  ignore_index=True)
 
-    args.out.mkdir(parents=True, exist_ok=True)
+    # ---- Split and run per-section -----------------------------------------
+    sections = split_by_type(df_base, df_new)
 
-    # ---- Comparison table --------------------------------------------------
-    print("\n--- Per-configuration comparison ---")
-    table = build_comparison_table(df_base, df_new)
+    if not sections:
+        sys.exit("No matching instance types found between baseline and new CSVs.")
 
-    col_b = f"{LABEL_BASELINE}_mean"
-    col_n = f"{LABEL_NEW}_mean"
-    for metric, grp in table.groupby("metric", sort=False):
-        print(f"\n  ── {metric} ──")
-        print(
-            grp[["config", col_b, col_n, "abs_diff", "rel_diff_%"]]
-            .to_string(index=False)
-        )
+    print(f"\nFound sections: {list(sections.keys())}")
 
-    timestamp  = datetime.now().strftime("%Y%m%d_%H%M%S")
-    table_path = args.out / f"comparison_{timestamp}.csv"
-    table.to_csv(table_path, index=False)
-    print(f"\n  Comparison CSV written to: {table_path}")
+    all_tables = []
+    for instance_type, (b, n) in sections.items():
+        section_dir = args.out / instance_type
+        run_section(b, n, instance_type, section_dir, all_tables)
 
-    # ---- Plots -------------------------------------------------------------
-    if not HAS_MPL:
-        return
-
-    print("\n--- Generating plots ---")
-
-    # Runtime
-    plot_metric(
-        df_base, df_new,
-        col="wall_time_s", ylabel="Mean wall-clock time (s)",
-        title=f"Runtime  [{LABEL_BASELINE} vs {LABEL_NEW}]",
-        filename="plot_runtime.png", out_dir=args.out,
-    )
-    plot_runtime_breakdown(df_base, df_new, args.out)
-
-    # Search reduction
-    for suffix, (col, ylabel, note) in SEARCH_COLS.items():
-        plot_metric(
-            df_base, df_new,
-            col=col, ylabel=ylabel,
-            title=f"Search – {ylabel}  [{LABEL_BASELINE} vs {LABEL_NEW}]  ({note})",
-            filename=f"plot_search_{suffix}.png", out_dir=args.out,
-        )
-
-    # Explanation quality
-    for suffix, (col, ylabel, note) in EXPL_QUALITY_COLS.items():
-        plot_metric(
-            df_base, df_new,
-            col=col, ylabel=ylabel,
-            title=f"Explanation quality – {ylabel}  [{LABEL_BASELINE} vs {LABEL_NEW}]  ({note})",
-            filename=f"plot_expl_{suffix}.png", out_dir=args.out,
-        )
-
-    # Explanation cost
-    for suffix, (col, ylabel, note) in EXPL_COST_COLS.items():
-        plot_metric(
-            df_base, df_new,
-            col=col, ylabel=ylabel,
-            title=f"Explanation cost – {ylabel}  [{LABEL_BASELINE} vs {LABEL_NEW}]  ({note})",
-            filename=f"plot_expl_{suffix}.png", out_dir=args.out,
-        )
-
-    # Speedup summary
-    plot_speedup(df_base, df_new, args.out)
+    # ---- Save combined comparison table ------------------------------------
+    if all_tables:
+        combined = pd.concat(all_tables, ignore_index=True)
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        table_path = args.out / f"comparison_{ts}.csv"
+        combined.to_csv(table_path, index=False)
+        print(f"\n  Full comparison CSV: {table_path}")
 
     print("\nDone.")
 
