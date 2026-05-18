@@ -7,6 +7,7 @@ use pumpkin_core::propagation::Propagator;
 use pumpkin_core::propagation::PropagatorConstructor;
 use pumpkin_core::propagation::PropagatorConstructorContext;
 use pumpkin_core::propagation::ReadDomains;
+use pumpkin_core::state::EmptyDomainConflict;
 use pumpkin_core::variables::IntegerVariable;
 use pumpkin_core::propagation::DomainEvents;
 use pumpkin_core::propagation::LocalId;
@@ -283,28 +284,38 @@ fn find_hall_set(graph: &BipartiteGraph, m: &Matching) -> (Vec<usize>, Vec<usize
 
 impl<Var: IntegerVariable + 'static> AllDifferentPropagator<Var> {
     fn check_matching_conflict(&self, domains: Domains) -> PropagationStatusCP {
-        //Step 1 : build bipartite graphs
+        // Step 1: build bipartite graph
         let graph = BipartiteGraph::build(&self.sucs, &domains);
 
-        //Step 2 : find the mazimu bipartite matching
+        // Step 2: maximum matching
         let matching = hopcroft_karp(&graph);
-        //Step 3 : check if matching = n = All diff satificable
+
+        // Step 3: if perfect matching exists, no conflict
         if matching.size == graph.n_vars {
             return Ok(());
         }
-        
-        //Step 4 : Derive hall violation
+
+        // Step 4: Hall set
         let (hall_vars, hall_vals) = find_hall_set(&graph, &matching);
 
-        //Step 5 build explanation + report conflict.
+        // Step 5: build explanation
         let conjunction =
             self.make_hall_explanation(domains, &graph, &hall_vars, &hall_vals);
- 
+
+        eprintln!(
+            "[AllDifferent] hall_vars={:?} hall_vals={:?} |conj|={}",
+            hall_vars,
+            hall_vals,
+            conjunction.len()
+        );
+
         Err(Conflict::Propagator(PropagatorConflict {
             conjunction,
             inference_code: self.inference_code.clone(),
         }))
     }
+
+
     fn make_hall_explanation(
         &self,
         domains: Domains,
@@ -312,35 +323,30 @@ impl<Var: IntegerVariable + 'static> AllDifferentPropagator<Var> {
         hall_vars: &[usize],
         hall_vals: &[usize],
     ) -> PropositionalConjunction {
+        let hall_val_set: std::collections::HashSet<usize> =
+            hall_vals.iter().copied().collect();
+
         hall_vars
             .iter()
             .flat_map(|&i| {
                 let var = &self.sucs[i];
- 
-                if let Some(fixed_val) = domains.fixed_value(var) {
-                    // Variable is fully assigned: one literal covers everything.
-                    // `succ[i] == fixed_val` implies `succ[i] != v` for all v != fixed_val,
-                    // so it subsumes every individual exclusion literal.
-                    vec![predicate!(var == fixed_val)]
-                } else {
-                    // Variable is not fixed: explain which values in N(S) are
-                    // excluded from its domain, since those exclusions are what
-                    // made N(S) too small.
-                    hall_vals
-                        .iter()
-                        .filter_map(|&v_idx| {
-                            let domain_val = v_idx as i32 + graph.val_offset;
-                            if !domains.contains(var, domain_val) {
-                                // This value is in N(S) but was removed from
-                                // succ[i]'s domain — that removal is on the trail
-                                // and is part of the Hall violation's cause.
-                                Some(predicate!(var != domain_val))
-                            } else {
-                                None
-                            }
-                        })
-                        .collect()
-                }
+
+                // For each value NOT in N(S) that has been pruned from var[i]'s
+                // domain: that pruning is what confines var[i] to N(S), so it
+                // must appear in the explanation.
+                (0..graph.n_vals)
+                    .filter(|v| !hall_val_set.contains(v))
+                    .filter_map(|v_idx| {
+                        let domain_val = v_idx as i32 + graph.val_offset;
+                        if !domains.contains(var, domain_val) {
+                            // This non-N(S) value was pruned from var[i],
+                            // forcing it into N(S).
+                            Some(predicate!(var != domain_val))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect::<Vec<_>>()
             })
             .collect()
     }
