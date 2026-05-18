@@ -52,12 +52,12 @@ except ImportError:
 # ---------------------------------------------------------------------------
 
 METRIC_COLS: dict[str, str] = {
-    "Runtime (s)"           : "wall_time_s",
+    "Runtime (s)"           : "solveTime",
     "Failures (backtracks)" : "failures",
     "Average LBD"               : "AverageLbd",
 }
 
-RUNTIME_COL     = "wall_time_s"
+RUNTIME_COL     = "solveTime"
 SEARCH_COL      = "failures"
 EXPLANATION_COL = "AverageLbd"
 

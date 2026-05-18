@@ -6,9 +6,16 @@ For every .tsp / .atsp file found in experiments/tsp/tsplib/:
 
   1. Convert  .tsp  →  .mzn   (via tsp_to_mzn.py)
   2. Flatten  .mzn  →  .fzn   (via minizinc --solver pumpkin -c)
-  3. Solve    .fzn             (via cargo run -p pumpkin-solver -- file.fzn -s)
+  3. Solve    .fzn             (via pre-built binary, NOT cargo run)
   4. Parse %%%mzn-stat lines from solver output
   5. Append one row to  experiments/tsp/results/stats_<timestamp>.csv
+
+Key fix over previous version
+------------------------------
+The solver binary is built ONCE with `cargo build` before the instance loop,
+then invoked directly for every solve call.  This removes per-instance Cargo
+startup overhead (~0.5-2s) from wall_time_s, making timing measurements
+comparable to solveTime reported by the solver itself.
 
 Directory layout (relative to Pumpkin project root)
 ----------------------------------------------------
@@ -29,7 +36,7 @@ Usage (from the Pumpkin project root)
 Options
 -------
   --timeout   INT   Per-instance solver timeout in seconds  (default: 300)
-  --release         Use cargo --release
+  --release         Use --release build (recommended for benchmarking)
   --no-convert      Skip .tsp→.mzn and .mzn→.fzn; reuse existing .fzn files
                     (use this on the second branch so instances are identical)
   --satisfy         Generate a satisfaction model instead of minimisation.
@@ -93,6 +100,33 @@ def parse_statistics(output: str) -> dict[str, str]:
 
 
 # ---------------------------------------------------------------------------
+# Build solver binary once
+# ---------------------------------------------------------------------------
+
+def build_solver(use_release: bool) -> Path:
+    """
+    Run `cargo build -p pumpkin-solver [--release]` once and return the
+    path to the compiled binary.  Calling this before the instance loop
+    ensures wall_time_s reflects only actual solve time, not Cargo overhead.
+    """
+    cmd = ["cargo", "build", "-p", "pumpkin-solver"]
+    if use_release:
+        cmd.append("--release")
+
+    profile = "release" if use_release else "debug"
+    binary  = PROJECT_ROOT / "target" / profile / "pumpkin-solver"
+
+    print(f"Building pumpkin-solver ({profile})...")
+    stdout, stderr, rc = run_cmd(cmd, cwd=PROJECT_ROOT)
+    if rc != 0:
+        print(f"ERROR: cargo build failed:\n{stderr}", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"  Binary: {binary}\n")
+    return binary
+
+
+# ---------------------------------------------------------------------------
 # Step 1 – .tsp → .mzn
 # ---------------------------------------------------------------------------
 
@@ -135,25 +169,25 @@ def flatten_to_fzn(mzn_path: Path) -> Path | None:
 
 
 # ---------------------------------------------------------------------------
-# Step 3 – solve .fzn
+# Step 3 – solve .fzn using pre-built binary
 # ---------------------------------------------------------------------------
 
 def solve_fzn(
     fzn_path: Path,
+    binary: Path,
     timeout: int,
-    use_release: bool,
 ) -> dict[str, str]:
+    """
+    Invoke the pre-built pumpkin-solver binary directly.
+    wall_time_s here is pure process execution time with no Cargo overhead.
+    """
     rel_fzn = fzn_path.relative_to(PROJECT_ROOT)
-
-    cargo_cmd = ["cargo", "run", "-p", "pumpkin-solver"]
-    if use_release:
-        cargo_cmd.append("--release")
-    cargo_cmd += ["--", str(rel_fzn), "-s"]
+    cmd = [str(binary), str(rel_fzn), "-s"]
 
     print(f"    [solve]    {fzn_path.name}", end="  ")
     t0 = time.perf_counter()
     try:
-        stdout, stderr, rc = run_cmd(cargo_cmd, cwd=PROJECT_ROOT, timeout=timeout)
+        stdout, stderr, rc = run_cmd(cmd, cwd=PROJECT_ROOT, timeout=timeout)
         wall = time.perf_counter() - t0
         status = "ok" if rc == 0 else "error"
     except subprocess.TimeoutExpired:
@@ -162,9 +196,9 @@ def solve_fzn(
         rc     = -1
         status = "timeout"
 
-    print(f"{status}  ({wall:.1f}s)")
+    print(f"{status}  ({wall:.3f}s)")
     stats = parse_statistics(stdout + stderr)
-    stats["wall_time_s"] = f"{wall:.3f}"
+    stats["wall_time_s"] = f"{wall:.6f}"
     stats["status"]      = status
     stats["return_code"] = str(rc)
     return stats
@@ -216,7 +250,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--timeout", type=int, default=300,
                    help="Per-instance solver timeout (seconds)")
     p.add_argument("--release", action="store_true",
-                   help="Use cargo --release")
+                   help="Use --release build (recommended for benchmarking)")
     p.add_argument("--no-convert", action="store_true",
                    help="Skip .tsp→.mzn and .mzn→.fzn; reuse existing .fzn files")
     p.add_argument("--instances", type=Path, nargs="+", default=None,
@@ -248,6 +282,9 @@ def main() -> None:
     args = parse_args()
     tsp_files = discover_tsp_files(args)
 
+    # Build once before the loop — eliminates Cargo overhead from timing
+    binary = build_solver(args.release)
+
     print(f"Found {len(tsp_files)} TSP instance(s) to process.\n")
     all_rows: list[dict] = []
 
@@ -268,7 +305,6 @@ def main() -> None:
         }
 
         if args.no_convert:
-            # Expect the .fzn to already exist from a previous run
             fzn_path = out_dir / (name + ".fzn")
             mzn_path = out_dir / (name + ".mzn")
             if not fzn_path.exists():
@@ -297,7 +333,7 @@ def main() -> None:
             row["fzn_file"] = str(fzn_path.relative_to(PROJECT_ROOT))
 
         # ---- solve --------------------------------------------------------
-        stats = solve_fzn(fzn_path, args.timeout, args.release)
+        stats = solve_fzn(fzn_path, binary, args.timeout)
         row.update(stats)
         all_rows.append(row)
 

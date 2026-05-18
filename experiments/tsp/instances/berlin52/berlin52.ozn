@@ -1,4 +1,0 @@
-output let {array [int] of string: X_INTRODUCED_30783_ = ["succ = ",show(succ),"\n","tourLength = ",show(tourLength),"\n"]} in (X_INTRODUCED_30783_);
-int: tourLength;
-set of int: Cities = 1..52;
-array [Cities] of int: succ;
