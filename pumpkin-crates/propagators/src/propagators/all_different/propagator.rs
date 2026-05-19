@@ -444,6 +444,66 @@ impl<Var: IntegerVariable + 'static> AllDifferentPropagator<Var> {
                 inference_code: self.inference_code.clone(),
             }));
         }
+        //Step 4 (Variant 2 start) - build directed reisdual graph
+        let residual = ResidualGraph::build(&graph, &matching);
+
+        //Step 5: Compute SCCs from residual graph
+        let scc_id = tarjan_scc(&residual);
+
+        //Step 6 - Pruning - 
+        /// unmatched edge can be pruned iff xi and v are in different SCCs - for each edge remove + generate exp
+        /// i collect all prunings first and then apply
+        /// 
+        /// Each pruning is (var_index, domain_value, exp)
+        let mut prunings: Vec<(usize, i32, PropositionalConjunction)> = Vec::new();
+ 
+        for i in 0..graph.n_vars {
+            let var_node = i;
+            let matched_val = matching.match_var[i]; // this value stays
+ 
+            for &v in &graph.adj[i] {
+                if v == matched_val {
+                    // matched edge — never prune the matched value
+                    continue; 
+                }
+                let val_node = graph.n_vars + v;
+ 
+                // Prune iff they are in different SCCs
+                if scc_id[var_node] != scc_id[val_node] {
+                    let domain_val = v as i32 + graph.val_offset;
+ 
+                    //explanation involves all variable in xi's SCC because hteir collective domain restrictrs -> make domain val impossible
+                    let explanation = self.make_pruning_explanation(
+                        &domains,
+                        &graph,
+                        &scc_id,
+                        i,            // the variable being pruned
+                        v,            // the value-index being pruned
+                        &matching,
+                    );
+ 
+                    prunings.push((i, domain_val, explanation));
+                }
+            }
+        }
+
+        /// NOW - Aplly prunings
+        for (var_idx, domain_val, reason) in prunings {
+            let var = &self.sucs[var_idx];
+ 
+            // Guard: only post if the value is still present.  Another pruning
+            // in this batch might have already removed it via a tightened bound.
+            if context.contains(var, domain_val) {
+                context.post(
+                    predicate!(var != domain_val),
+                    reason,
+                    &self.inference_code,
+                )?;
+            }
+        }
+ 
+
+
         Ok(())
     }
 
@@ -497,6 +557,70 @@ impl<Var: IntegerVariable + 'static> AllDifferentPropagator<Var> {
             })
             .collect()
     }
+
+   fn make_pruning_explanation(
+    &self,
+    domains: &Domains,
+    graph: &BipartiteGraph,
+    scc_id: &[usize],
+    var_idx: usize,
+    pruned_val_idx: usize,
+    matching: &Matching,
+) -> PropositionalConjunction {
+    let xi_scc = scc_id[var_idx];
+
+    // Variables in the same SCC as xi form a tight set S:
+    // their collective neighbourhood N(S) exactly equals the values
+    // reachable from them in the residual graph (same SCC as some value node).
+    let scc_vars: Vec<usize> = (0..graph.n_vars)
+        .filter(|&j| scc_id[j] == xi_scc)
+        .collect();
+
+    // N(S): value-indices whose value-node shares the SCC with xi's var-node.
+    // (Only values reachable via residual paths from xi's SCC belong here.)
+    let n_s: std::collections::HashSet<usize> = (0..graph.n_vals)
+        .filter(|&v| scc_id[graph.n_vars + v] == xi_scc)
+        .collect();
+
+    // Build confinement literals: for each var j in S, explain why
+    // its domain is confined to N(S). These ARE domain-state facts on the trail.
+    let lits: Vec<_> = scc_vars
+        .iter()
+        .flat_map(|&j| {
+            let var = &self.sucs[j];
+            let lb = domains.lower_bound(var);
+            let ub = domains.upper_bound(var);
+
+            if let Some(fv) = domains.fixed_value(var) {
+                vec![predicate!(var == fv)]
+            } else {
+                let mut v_lits = vec![
+                    predicate!(var >= lb),
+                    predicate!(var <= ub),
+                ];
+                // Holes inside [lb, ub] that are outside N(S) and absent
+                // from the domain — these are trail facts that confine j to N(S).
+                for v_idx in 0..graph.n_vals {
+                    if n_s.contains(&v_idx) {
+                        continue;
+                    }
+                    let dv = v_idx as i32 + graph.val_offset;
+                    if dv <= lb || dv >= ub {
+                        continue; // covered by bounds already
+                    }
+                    if !domains.contains(var, dv) {
+                        v_lits.push(predicate!(var != dv));
+                    }
+                }
+                v_lits
+            }
+        })
+        .collect();
+
+    // NOTE: No matching-derived literals — matching is not a trail fact.
+    lits.into_iter().collect()
+}
+
 }
 
 
