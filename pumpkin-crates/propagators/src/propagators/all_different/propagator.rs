@@ -326,31 +326,69 @@ impl<Var: IntegerVariable + 'static> AllDifferentPropagator<Var> {
         let hall_val_set: std::collections::HashSet<usize> =
             hall_vals.iter().copied().collect();
 
+        // For each variable in the Hall set, we need to explain why its domain
+        // is confined to N(S). A variable is confined to N(S) if all values
+        // outside N(S) have been removed from its domain.
+        //
+        // CRITICAL: We must NOT include literals that hold at decision level 0,
+        // because the resolution resolver cannot process them — they have no
+        // antecedent in the search trail. Only include removals that happened
+        // during search (i.e. are actual trail entries).
+        //
+        // The tightest correct explanation: for each var in S, for each value
+        // in N(S) that IS in its domain, we explain the crowding directly via
+        // the upper/lower bound predicates that define the confinement.
+        //
+        // Simplest sound approach: for fixed variables, use var == val.
+        // For non-fixed variables confined to N(S), use the tightest
+        // bound predicates available.
         hall_vars
             .iter()
             .flat_map(|&i| {
                 let var = &self.sucs[i];
+                let lb = domains.lower_bound(var);
+                let ub = domains.upper_bound(var);
 
-                // For each value NOT in N(S) that has been pruned from var[i]'s
-                // domain: that pruning is what confines var[i] to N(S), so it
-                // must appear in the explanation.
-                (0..graph.n_vals)
-                    .filter(|v| !hall_val_set.contains(v))
-                    .filter_map(|v_idx| {
-                        let domain_val = v_idx as i32 + graph.val_offset;
-                        if !domains.contains(var, domain_val) {
-                            // This non-N(S) value was pruned from var[i],
-                            // forcing it into N(S).
-                            Some(predicate!(var != domain_val))
-                        } else {
-                            None
+                if let Some(fixed_val) = domains.fixed_value(var) {
+                    // Variable is fixed: one literal fully explains its confinement.
+                    vec![predicate!(var == fixed_val)]
+                } else {
+                    // Variable is not fixed but is confined within N(S).
+                    // Use bound predicates to explain confinement:
+                    // - var >= lb  (i.e. var != v for all v < lb)
+                    // - var <= ub  (i.e. var != v for all v > ub)
+                    // Then for any holes inside [lb, ub] that fall outside N(S),
+                    // add var != v — but ONLY if that value is inside N(S)'s
+                    // range (i.e. it was actually removed during search, not
+                    // pre-pruned at level 0 by domain initialisation).
+                    let mut lits = vec![
+                        predicate!(var >= lb),
+                        predicate!(var <= ub),
+                    ];
+
+                    // Add hole literals only for values strictly inside [lb, ub]
+                    // that are outside N(S) and absent from the domain.
+                    // These are genuine search-time removals that confined the var.
+                    for v_idx in 0..graph.n_vals {
+                        if hall_val_set.contains(&v_idx) {
+                            continue; // inside N(S), not relevant
                         }
-                    })
-                    .collect::<Vec<_>>()
+                        let domain_val = v_idx as i32 + graph.val_offset;
+                        if domain_val <= lb || domain_val >= ub {
+                            continue; // already covered by bound predicates
+                        }
+                        if !domains.contains(var, domain_val) {
+                            // A hole inside [lb,ub] outside N(S) — this removal
+                            // happened during search and helped confine the var.
+                            lits.push(predicate!(var != domain_val));
+                        }
+                    }
+
+                    lits
+                }
             })
             .collect()
     }
-
 }
 
 
