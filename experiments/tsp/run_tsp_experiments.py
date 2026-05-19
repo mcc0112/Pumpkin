@@ -4,18 +4,14 @@ run_tsp_experiments.py  –  TSP benchmark pipeline for Pumpkin
 
 For every .tsp / .atsp file found in experiments/tsp/tsplib/:
 
-  1. Convert  .tsp  →  .mzn   (via tsp_to_mzn.py)
-  2. Flatten  .mzn  →  .fzn   (via minizinc --solver pumpkin -c)
-  3. Solve    .fzn             (via pre-built binary, NOT cargo run)
+  1. Build    pumpkin-solver once with `cargo build --release`
+  2. Convert  .tsp  →  .mzn   (via tsp_to_mzn.py)
+  3. Solve    .mzn             (via minizinc --solver pumpkin-circuit <mzn> -s)
   4. Parse %%%mzn-stat lines from solver output
   5. Append one row to  experiments/tsp/results/stats_<timestamp>.csv
 
-Key fix over previous version
-------------------------------
-The solver binary is built ONCE with `cargo build` before the instance loop,
-then invoked directly for every solve call.  This removes per-instance Cargo
-startup overhead (~0.5-2s) from wall_time_s, making timing measurements
-comparable to solveTime reported by the solver itself.
+The solver is built ONCE before the instance loop so that Cargo startup
+overhead is never included in wall_time_s measurements.
 
 Directory layout (relative to Pumpkin project root)
 ----------------------------------------------------
@@ -24,7 +20,6 @@ experiments/tsp/
   instances/
     berlin52/
       berlin52.mzn
-      berlin52.fzn
     ...
   results/
     stats_<timestamp>.csv
@@ -36,8 +31,8 @@ Usage (from the Pumpkin project root)
 Options
 -------
   --timeout   INT   Per-instance solver timeout in seconds  (default: 300)
-  --release         Use --release build (recommended for benchmarking)
-  --no-convert      Skip .tsp→.mzn and .mzn→.fzn; reuse existing .fzn files
+  --solver    STR   MiniZinc solver name  (default: pumpkin-circuit)
+  --no-convert      Skip .tsp→.mzn; reuse existing .mzn files
                     (use this on the second branch so instances are identical)
   --satisfy         Generate a satisfaction model instead of minimisation.
                     Solver stops at the first circuit within the NN bound.
@@ -49,7 +44,6 @@ Options
 
 import argparse
 import csv
-import os
 import subprocess
 import sys
 import time
@@ -100,34 +94,26 @@ def parse_statistics(output: str) -> dict[str, str]:
 
 
 # ---------------------------------------------------------------------------
-# Build solver binary once
+# Step 1 – Build solver binary once
 # ---------------------------------------------------------------------------
 
-def build_solver(use_release: bool) -> Path:
+def build_solver() -> None:
     """
-    Run `cargo build -p pumpkin-solver [--release]` once and return the
-    path to the compiled binary.  Calling this before the instance loop
-    ensures wall_time_s reflects only actual solve time, not Cargo overhead.
+    Run `cargo build --release -p pumpkin-solver` once before the instance
+    loop so the binary is up-to-date and Cargo startup overhead never
+    contaminates per-instance wall_time_s measurements.
     """
-    cmd = ["cargo", "build", "-p", "pumpkin-solver"]
-    if use_release:
-        cmd.append("--release")
-
-    profile = "release" if use_release else "debug"
-    binary  = PROJECT_ROOT / "target" / profile / "pumpkin-solver"
-
-    print(f"Building pumpkin-solver ({profile})...")
+    cmd = ["cargo", "build", "--release", "-p", "pumpkin-solver"]
+    print("Building pumpkin-solver (release)...")
     stdout, stderr, rc = run_cmd(cmd, cwd=PROJECT_ROOT)
     if rc != 0:
         print(f"ERROR: cargo build failed:\n{stderr}", file=sys.stderr)
         sys.exit(1)
-
-    print(f"  Binary: {binary}\n")
-    return binary
+    print("  Build OK.\n")
 
 
 # ---------------------------------------------------------------------------
-# Step 1 – .tsp → .mzn
+# Step 2 – .tsp → .mzn
 # ---------------------------------------------------------------------------
 
 def convert_to_mzn(tsp_path: Path, out_dir: Path, satisfy: bool = False) -> Path | None:
@@ -138,7 +124,7 @@ def convert_to_mzn(tsp_path: Path, out_dir: Path, satisfy: bool = False) -> Path
     if satisfy:
         cmd.append("--satisfy")
     print(f"    [tsp→mzn]  {tsp_path.name}", end="  ")
-    stdout, stderr, rc = run_cmd(cmd, cwd=PROJECT_ROOT)
+    _, stderr, rc = run_cmd(cmd, cwd=PROJECT_ROOT)
 
     if rc != 0:
         print(f"FAILED (rc={rc})")
@@ -149,42 +135,24 @@ def convert_to_mzn(tsp_path: Path, out_dir: Path, satisfy: bool = False) -> Path
 
 
 # ---------------------------------------------------------------------------
-# Step 2 – .mzn → .fzn
+# Step 3 – Solve with a single minizinc call
 # ---------------------------------------------------------------------------
 
-def flatten_to_fzn(mzn_path: Path) -> Path | None:
-    fzn_path = mzn_path.with_suffix(".fzn")
-    rel_mzn  = mzn_path.relative_to(PROJECT_ROOT)
-
-    cmd = ["minizinc", "--solver", "pumpkin", "-c", str(rel_mzn)]
-    print(f"    [mzn→fzn]  {mzn_path.name}", end="  ")
-    stdout, stderr, rc = run_cmd(cmd, cwd=PROJECT_ROOT)
-
-    if rc != 0 or not fzn_path.exists():
-        print(f"FAILED (rc={rc})")
-        print(f"      {stderr[:300]}", file=sys.stderr)
-        return None
-    print(f"OK  →  {fzn_path.name}")
-    return fzn_path
-
-
-# ---------------------------------------------------------------------------
-# Step 3 – solve .fzn using pre-built binary
-# ---------------------------------------------------------------------------
-
-def solve_fzn(
-    fzn_path: Path,
-    binary: Path,
+def solve_mzn(
+    mzn_path: Path,
+    solver: str,
     timeout: int,
 ) -> dict[str, str]:
     """
-    Invoke the pre-built pumpkin-solver binary directly.
-    wall_time_s here is pure process execution time with no Cargo overhead.
+    Invoke minizinc --solver <solver> <mzn> -s directly.
+    MiniZinc handles flattening internally; solveTime in the stats reflects
+    only the solver's own time. wall_time_s covers the full process including
+    flattening, but solveTime is the clean metric to use for comparison.
     """
-    rel_fzn = fzn_path.relative_to(PROJECT_ROOT)
-    cmd = [str(binary), str(rel_fzn), "-s"]
+    rel_mzn = mzn_path.relative_to(PROJECT_ROOT)
+    cmd = ["minizinc", "--solver", solver, str(rel_mzn), "-s"]
 
-    print(f"    [solve]    {fzn_path.name}", end="  ")
+    print(f"    [solve]    {mzn_path.name}", end="  ")
     t0 = time.perf_counter()
     try:
         stdout, stderr, rc = run_cmd(cmd, cwd=PROJECT_ROOT, timeout=timeout)
@@ -197,6 +165,8 @@ def solve_fzn(
         status = "timeout"
 
     print(f"{status}  ({wall:.3f}s)")
+
+    # MiniZinc emits stats to both stdout and stderr depending on version
     stats = parse_statistics(stdout + stderr)
     stats["wall_time_s"] = f"{wall:.6f}"
     stats["status"]      = status
@@ -213,7 +183,6 @@ FIXED_COLS = [
     "instance_name",
     "tsp_file",
     "mzn_file",
-    "fzn_file",
     "status",
     "return_code",
     "wall_time_s",
@@ -247,20 +216,19 @@ def parse_args() -> argparse.Namespace:
         description="Run TSP benchmarks through Pumpkin.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    p.add_argument("--timeout", type=int, default=300,
+    p.add_argument("--timeout",    type=int, default=300,
                    help="Per-instance solver timeout (seconds)")
-    p.add_argument("--release", action="store_true",
-                   help="Use --release build (recommended for benchmarking)")
+    p.add_argument("--solver",     type=str, default="pumpkin-circuit",
+                   help="MiniZinc solver name passed to --solver")
     p.add_argument("--no-convert", action="store_true",
-                   help="Skip .tsp→.mzn and .mzn→.fzn; reuse existing .fzn files")
-    p.add_argument("--instances", type=Path, nargs="+", default=None,
-                   help="Specific .tsp/.atsp files to run (default: all in tsplib/)")
-    p.add_argument("--satisfy", action="store_true",
+                   help="Skip .tsp→.mzn; reuse existing .mzn files")
+    p.add_argument("--satisfy",    action="store_true",
                    help=(
                        "Use satisfy mode: find first circuit within NN bound "
-                       "instead of proving optimality. Faster; better for "
-                       "isolating propagator search reduction."
+                       "instead of proving optimality."
                    ))
+    p.add_argument("--instances",  type=Path, nargs="+", default=None,
+                   help="Specific .tsp/.atsp files to run (default: all in tsplib/)")
     return p.parse_args()
 
 
@@ -279,11 +247,11 @@ def discover_tsp_files(args: argparse.Namespace) -> list[Path]:
 
 
 def main() -> None:
-    args = parse_args()
+    args      = parse_args()
     tsp_files = discover_tsp_files(args)
 
-    # Build once before the loop — eliminates Cargo overhead from timing
-    binary = build_solver(args.release)
+    # Build once before the loop — keeps Cargo overhead out of timing
+    build_solver()
 
     print(f"Found {len(tsp_files)} TSP instance(s) to process.\n")
     all_rows: list[dict] = []
@@ -300,40 +268,27 @@ def main() -> None:
             "instance_name": name,
             "tsp_file"     : str(tsp_path.relative_to(PROJECT_ROOT)),
             "mzn_file"     : "",
-            "fzn_file"     : "",
             "mode"         : "satisfy" if args.satisfy else "minimize",
         }
 
         if args.no_convert:
-            fzn_path = out_dir / (name + ".fzn")
             mzn_path = out_dir / (name + ".mzn")
-            if not fzn_path.exists():
-                print(f"    [skip] .fzn not found at {fzn_path}  –  skipping")
-                row["status"] = "fzn_missing"
+            if not mzn_path.exists():
+                print(f"    [skip] .mzn not found at {mzn_path}  –  skipping")
+                row["status"] = "mzn_missing"
                 all_rows.append(row)
                 continue
-            print(f"    [reuse] {fzn_path.name}")
-            row["mzn_file"] = str(mzn_path.relative_to(PROJECT_ROOT)) if mzn_path.exists() else ""
-            row["fzn_file"] = str(fzn_path.relative_to(PROJECT_ROOT))
+            print(f"    [reuse] {mzn_path.name}")
         else:
-            # ---- tsp → mzn ------------------------------------------------
             mzn_path = convert_to_mzn(tsp_path, out_dir, satisfy=args.satisfy)
             if mzn_path is None:
                 row["status"] = "mzn_conversion_failed"
                 all_rows.append(row)
                 continue
-            row["mzn_file"] = str(mzn_path.relative_to(PROJECT_ROOT))
 
-            # ---- mzn → fzn ------------------------------------------------
-            fzn_path = flatten_to_fzn(mzn_path)
-            if fzn_path is None:
-                row["status"] = "fzn_conversion_failed"
-                all_rows.append(row)
-                continue
-            row["fzn_file"] = str(fzn_path.relative_to(PROJECT_ROOT))
+        row["mzn_file"] = str(mzn_path.relative_to(PROJECT_ROOT))
 
-        # ---- solve --------------------------------------------------------
-        stats = solve_fzn(fzn_path, binary, args.timeout)
+        stats = solve_mzn(mzn_path, args.solver, args.timeout)
         row.update(stats)
         all_rows.append(row)
 
