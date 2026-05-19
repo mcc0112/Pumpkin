@@ -7,7 +7,6 @@ use pumpkin_core::propagation::Propagator;
 use pumpkin_core::propagation::PropagatorConstructor;
 use pumpkin_core::propagation::PropagatorConstructorContext;
 use pumpkin_core::propagation::ReadDomains;
-use pumpkin_core::state::EmptyDomainConflict;
 use pumpkin_core::variables::IntegerVariable;
 use pumpkin_core::propagation::DomainEvents;
 use pumpkin_core::propagation::LocalId;
@@ -83,7 +82,9 @@ impl<Var: IntegerVariable + 'static> Propagator for AllDifferentPropagator<Var> 
         self.check_matching_conflict(context.domains())
     }
 }
-///////     GRAPH BUILDING
+///
+/// STEP 1 - Build Bipartite Graph from domains - creates an adjacency list where adj[i] is the list of value -indices reachable from variable i 
+
 struct BipartiteGraph {
     n_vars: usize,
     n_vals: usize,
@@ -95,6 +96,7 @@ struct BipartiteGraph {
 }
  
 impl BipartiteGraph {
+    //for debugging purposes
     fn debug_print(&self) {
         println!("BipartiteGraph:");
         println!("  n_vars = {}", self.n_vars);
@@ -110,7 +112,7 @@ impl BipartiteGraph {
         }
     }
     fn build<Var: IntegerVariable>(successors: &[Var], domains: &Domains) -> Self {
-        // Find global min/max over all domains to size the value array.
+        // Finds min/max to establish size of array.
         let val_offset = successors
             .iter()
             .map(|v| domains.lower_bound(v))
@@ -138,7 +140,8 @@ impl BipartiteGraph {
 }
 
 
-///////     STEP 2: RUN MATCHING
+
+/// STEP 2 - HOPCROFT-KARP MATCHING (BFS:build layerd graph of shortest augmenting paths + DFS: actually aguments along those paths) 
 const UNMATCHED: usize = usize::MAX;
 const INF_DIST: usize = usize::MAX;
  
@@ -166,9 +169,8 @@ fn hopcroft_karp(graph: &BipartiteGraph) -> Matching {
     loop {
         // ---- BFS phase: build layered graph of shortest augmenting paths ----
         //
-        // dist[i] = distance of variable-node i from the set of free variable-
-        // nodes, following alternating (free, matched, free, ...) arcs.
-        // We only store distances for variable-nodes; value-nodes are implicit.
+        // dist[i] = distance of variable-node i from the set of free variable-nodes, following alternating (free, matched, free, ...) arcs.
+        // only store distances for variable-nodes; value-nodes are implicit.
         let mut dist = vec![INF_DIST; graph.n_vars];
         let mut queue = std::collections::VecDeque::new();
  
@@ -195,12 +197,10 @@ fn hopcroft_karp(graph: &BipartiteGraph) -> Matching {
                 }
             }
         }
- 
         if !found_augmenting {
             break; // Maximum matching reached.
         }
- 
-        // ---- DFS phase: augment along vertex-disjoint shortest paths ----
+        // ---- DFS phase: augmentation ----
         for i in 0..graph.n_vars {
             if m.match_var[i] == UNMATCHED && dfs_augment(i, graph, &mut m, &mut dist) {
                 m.size += 1;
@@ -211,12 +211,7 @@ fn hopcroft_karp(graph: &BipartiteGraph) -> Matching {
     m
 }
  
-fn dfs_augment(
-    i: usize,
-    graph: &BipartiteGraph,
-    m: &mut Matching,
-    dist: &mut [usize],
-) -> bool {
+fn dfs_augment(i: usize, graph: &BipartiteGraph, m: &mut Matching, dist: &mut [usize],) -> bool {
     for &v in &graph.adj[i] {
         let next = m.match_val[v];
         // Only follow edges that respect the layered structure.
@@ -237,7 +232,9 @@ fn dfs_augment(
     false
 }
 
-//// STEP 3 - FIND HALL SET
+//// STEP 3 - FIND HALL SET - finds hall violation by doing a BFS from all unmatched variables, following free arcs forward sand marchign arcs bachkwards. 
+/// then the variables in this BFS are exactly the Hall set S and the values are N(S) 
+
 fn find_hall_set(graph: &BipartiteGraph, m: &Matching) -> (Vec<usize>, Vec<usize>) {
     let mut var_visited = vec![false; graph.n_vars];
     let mut val_visited = vec![false; graph.n_vals];
@@ -254,8 +251,8 @@ fn find_hall_set(graph: &BipartiteGraph, m: &Matching) -> (Vec<usize>, Vec<usize
     while let Some(i) = queue.pop_front() {
         for &v in &graph.adj[i] {
             if !val_visited[v] {
-                val_visited[v] = true; // reached this value-node via a free arc
-                // Follow the matching arc back to a variable-node.
+                val_visited[v] = true; // reached this value-node throufh a free arc
+                // Follow the matching arc back to variable-node.
                 let matched_var = m.match_val[v];
                 if matched_var != UNMATCHED && !var_visited[matched_var] {
                     var_visited[matched_var] = true;
@@ -268,9 +265,7 @@ fn find_hall_set(graph: &BipartiteGraph, m: &Matching) -> (Vec<usize>, Vec<usize
     let hall_vars: Vec<usize> = (0..graph.n_vars).filter(|&i| var_visited[i]).collect();
     let hall_vals: Vec<usize> = (0..graph.n_vals).filter(|&v| val_visited[v]).collect();
  
-    // This holds by König's theorem: the alternating-reachable set from
-    // unmatched variables always has a strictly smaller neighbourhood when
-    // the matching is not perfect. If this fires, hopcroft_karp has a bug.
+    // check: if this fire Hopcroft-karp = bug
     debug_assert!(
         hall_vals.len() < hall_vars.len(),
         "Bug in Hall extraction: |N(S)|={} >= |S|={}",
@@ -316,32 +311,13 @@ impl<Var: IntegerVariable + 'static> AllDifferentPropagator<Var> {
     }
 
 
-    fn make_hall_explanation(
-        &self,
-        domains: Domains,
-        graph: &BipartiteGraph,
-        hall_vars: &[usize],
-        hall_vals: &[usize],
-    ) -> PropositionalConjunction {
+    fn make_hall_explanation(&self, domains: Domains,graph: &BipartiteGraph,hall_vars: &[usize], hall_vals: &[usize],) -> PropositionalConjunction {
         let hall_val_set: std::collections::HashSet<usize> =
             hall_vals.iter().copied().collect();
-
+        // IDEA: - show confinement
         // For each variable in the Hall set, we need to explain why its domain
         // is confined to N(S). A variable is confined to N(S) if all values
         // outside N(S) have been removed from its domain.
-        //
-        // CRITICAL: We must NOT include literals that hold at decision level 0,
-        // because the resolution resolver cannot process them — they have no
-        // antecedent in the search trail. Only include removals that happened
-        // during search (i.e. are actual trail entries).
-        //
-        // The tightest correct explanation: for each var in S, for each value
-        // in N(S) that IS in its domain, we explain the crowding directly via
-        // the upper/lower bound predicates that define the confinement.
-        //
-        // Simplest sound approach: for fixed variables, use var == val.
-        // For non-fixed variables confined to N(S), use the tightest
-        // bound predicates available.
         hall_vars
             .iter()
             .flat_map(|&i| {
@@ -355,20 +331,15 @@ impl<Var: IntegerVariable + 'static> AllDifferentPropagator<Var> {
                 } else {
                     // Variable is not fixed but is confined within N(S).
                     // Use bound predicates to explain confinement:
-                    // - var >= lb  (i.e. var != v for all v < lb)
-                    // - var <= ub  (i.e. var != v for all v > ub)
+
                     // Then for any holes inside [lb, ub] that fall outside N(S),
                     // add var != v — but ONLY if that value is inside N(S)'s
-                    // range (i.e. it was actually removed during search, not
-                    // pre-pruned at level 0 by domain initialisation).
                     let mut lits = vec![
                         predicate!(var >= lb),
                         predicate!(var <= ub),
                     ];
 
-                    // Add hole literals only for values strictly inside [lb, ub]
-                    // that are outside N(S) and absent from the domain.
-                    // These are genuine search-time removals that confined the var.
+                    // Add hole literals only for values strictly inside [lb, ub] that are outside N(S) and absent from the domain.
                     for v_idx in 0..graph.n_vals {
                         if hall_val_set.contains(&v_idx) {
                             continue; // inside N(S), not relevant
