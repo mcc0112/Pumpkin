@@ -72,14 +72,14 @@ impl<Var: IntegerVariable + 'static> Propagator for AllDifferentPropagator<Var> 
         "AllDifferent"
     }
     fn propagate(&mut self, mut context: PropagationContext) -> pumpkin_core::state::PropagationStatusCP {
-        self.check_matching_conflict(context.domains())
+        self.check_conflict_and_propgate(context)
     }
 
     fn propagate_from_scratch(
         &self,
         mut context: PropagationContext,
     ) -> pumpkin_core::state::PropagationStatusCP {
-        self.check_matching_conflict(context.domains())
+        self.check_conflict_and_propgate(context)
     }
 }
 ///
@@ -276,38 +276,175 @@ fn find_hall_set(graph: &BipartiteGraph, m: &Matching) -> (Vec<usize>, Vec<usize
     (hall_vars, hall_vals)
 }
 
+// ============================]
+// Variant 2 - Residual Graph + Tarjan's SCC
+// ===============================
+
+/// IDEA 
+/// residual graph is a directed graph ove rhte same nodes as the biparitite graph
+/// with edge direction determeined by the matching if (xi, v) in M then v -> xi else xi -> v
+/// This is so that the residual graph captures exaclty the alternating paths used by augmenting paths
+/// 
+/// Tarjan's theorem: and edge can be in some perfect mathcing iff xi and v lie in the same SCC of the residual graph 
+/// THUS any unmatched edge crossing SCCS is impossible and can be pruned. 
+struct ResidualGraph {
+    n_nodes: usize,
+    // adj_residual[node] = list of successor nodes in the residual digraph
+    adj: Vec<Vec<usize>>,
+}
+
+impl ResidualGraph {
+    fn build( graph: &BipartiteGraph, m:&Matching) -> Self {
+        //Decision: inline variable nodes 0..n_vars and value nodes as n_vars..n_vars+n_vals - avoids ovehead 
+        let n_vars = graph.n_vars;
+        let n_vals = graph.n_vals;
+        let n_nodes = n_vars + n_vals;
+        let mut adj = vec![Vec::new(); n_nodes];
+
+        for i in 0..n_vars {
+            for &v in &graph.adj[i] {
+                let var_node = i;
+                let val_node = n_vars + v;
+                if m.match_var[i] == v {
+                    // Matched edge: direction is value → variable
+                    adj[val_node].push(var_node);
+                } else {
+                    // Unmatched edge: direction is variable → value
+                    adj[var_node].push(val_node);
+                }
+            }
+        }
+        ResidualGraph { n_nodes, adj }
+    }
+}
+///
+/// STILL ON TARJAN
+/// ======================
+/// Compared to others (e.g Kosaraju) - Tarjan runs in one DFX pass
+/// Output: scc_id[node] -> every node is the sanme SCC ges teh same ID
+/// NOTE: Ids are assinged in reverse topoclogical order of condensnationDAG
+/// purning => important -> scc_id[xi] == scc_id[val_node]
+/// 
+struct TarjanState {
+    index:    usize,
+    stack:    Vec<usize>,
+    on_stack: Vec<bool>,
+    indices:  Vec<Option<usize>>,
+    lowlinks: Vec<usize>,
+    scc_id:   Vec<usize>,
+    next_id:  usize,
+}
+ 
+impl TarjanState {
+    fn new(n: usize) -> Self {
+        TarjanState {
+            index: 0,
+            stack: Vec::new(),
+            on_stack: vec![false; n],
+            indices: vec![None; n],
+            lowlinks: vec![0; n],
+            scc_id: vec![0; n],
+            next_id: 0,
+        }
+    }
+}
+ 
+fn tarjan_scc(graph: &ResidualGraph) -> Vec<usize> {
+    let n = graph.n_nodes;
+    let mut state = TarjanState::new(n);
+    // Iterative Tarjan to avoid stack overflows on larger instances.
+    // Each entry on the call stack is (node, iterator position in adj[node]).
+    for start in 0..n {
+        if state.indices[start].is_none() {
+            tarjan_visit(start, &graph.adj, &mut state);
+        }
+    }
+    state.scc_id
+}
+ 
+fn tarjan_visit(start: usize, adj: &[Vec<usize>], state: &mut TarjanState) {
+    // Iterative version of the classic recursive Tarjan algorithm.
+    // call_stack entries: (node, index into adj[node] we've processed so far)
+    let mut call_stack: Vec<(usize, usize)> = Vec::new();
+ 
+    // "Enter" the start node
+    state.indices[start]  = Some(state.index);
+    state.lowlinks[start] = state.index;
+    state.index += 1;
+    state.stack.push(start);
+    state.on_stack[start] = true;
+    call_stack.push((start, 0));
+ 
+    'outer: while let Some((v, ref mut ei)) = call_stack.last_mut().copied().map(|x| x) {
+        let ei_ref = &mut call_stack.last_mut().unwrap().1;
+ 
+        if *ei_ref < adj[v].len() {
+            let w = adj[v][*ei_ref];
+            *ei_ref += 1;
+ 
+            if state.indices[w].is_none() {
+                // Tree edge: recurse into w
+                state.indices[w]  = Some(state.index);
+                state.lowlinks[w] = state.index;
+                state.index += 1;
+                state.stack.push(w);
+                state.on_stack[w] = true;
+                call_stack.push((w, 0));
+            } else if state.on_stack[w] {
+                // Back edge: update lowlink
+                let w_idx = state.indices[w].unwrap();
+                if w_idx < state.lowlinks[v] {
+                    state.lowlinks[v] = w_idx;
+                }
+            }
+            // Cross/forward edges: ignore (w already fully processed)
+        } else {
+            // All neighbours of v processed — pop v
+            call_stack.pop();
+ 
+            if let Some(&(parent, _)) = call_stack.last() {
+                // Propagate lowlink upward
+                if state.lowlinks[v] < state.lowlinks[parent] {
+                    state.lowlinks[parent] = state.lowlinks[v];
+                }
+            }
+ 
+            // Check if v is the root of an SCC
+            if state.lowlinks[v] == state.indices[v].unwrap() {
+                // Pop SCC from the stack and assign IDs
+                loop {
+                    let w = state.stack.pop().unwrap();
+                    state.on_stack[w] = false;
+                    state.scc_id[w] = state.next_id;
+                    if w == v { break; }
+                }
+                state.next_id += 1;
+            }
+        }
+    }
+}
 
 impl<Var: IntegerVariable + 'static> AllDifferentPropagator<Var> {
-    fn check_matching_conflict(&self, domains: Domains) -> PropagationStatusCP {
+    fn check_conflict_and_propgate(&self, mut context: PropagationContext) -> PropagationStatusCP {
+        let domains = context.domains();
         // Step 1: build bipartite graph
         let graph = BipartiteGraph::build(&self.sucs, &domains);
 
         // Step 2: maximum matching
         let matching = hopcroft_karp(&graph);
 
-        // Step 3: if perfect matching exists, no conflict
-        if matching.size == graph.n_vars {
-            return Ok(());
+        //Step 3 : Conflict Check (variant 1) - if no perfect matching-> hall violation -> raise conflict
+        if matching.size < graph.n_vars {
+            let (hall_vars, hall_vals) = find_hall_set(&graph, &matching);
+            let conjunction = self.make_hall_explanation(
+                domains, &graph, &hall_vars, &hall_vals,
+            );
+            return Err(Conflict::Propagator(PropagatorConflict {
+                conjunction,
+                inference_code: self.inference_code.clone(),
+            }));
         }
-
-        // Step 4: Hall set
-        let (hall_vars, hall_vals) = find_hall_set(&graph, &matching);
-
-        // Step 5: build explanation
-        let conjunction =
-            self.make_hall_explanation(domains, &graph, &hall_vars, &hall_vals);
-
-        eprintln!(
-            "[AllDifferent] hall_vars={:?} hall_vals={:?} |conj|={}",
-            hall_vars,
-            hall_vals,
-            conjunction.len()
-        );
-
-        Err(Conflict::Propagator(PropagatorConflict {
-            conjunction,
-            inference_code: self.inference_code.clone(),
-        }))
+        Ok(())
     }
 
 
