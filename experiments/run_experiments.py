@@ -2,30 +2,21 @@
 run_experiments.py  –  Circuit propagator benchmark runner
 ===========================================================
 
-Generates MiniZinc instances (SAT and/or UNSAT), converts each to FlatZinc,
-solves with pumpkin-solver, and saves per-run statistics to a CSV file.
+Builds the solver once with `cargo build --release`, then generates
+MiniZinc instances and solves each with:
 
-Key improvements over the original:
-  - Builds the solver binary ONCE with `cargo build` before the experiment
-    loop, so wall-clock timing is not contaminated by Cargo startup overhead.
-  - Supports UNSAT instance generation via generate_unsat_instances.py.
-  - Adds an `instance_type` column (sat / unsat_random / unsat_forced) to
-    the output CSV so SAT and UNSAT results can be analysed separately.
+    minizinc --solver pumpkin-circuit <instance.mzn> -s
+
+and saves per-run statistics to a CSV file.
 
 Directory layout inside the Pumpkin project root
 -------------------------------------------------
 experiments/
 ├── generate_instances.py
-├── generate_unsat_instances.py
 ├── run_experiments.py          (this file)
 ├── instances/
-│   ├── sat/
-│   │   └── n<N>_k<K>/
-│   └── unsat/
-│       ├── random/
-│       │   └── n<N>_k<K>/
-│       └── forced/
-│           └── n<N>_k<K>/
+│   └── sat/
+│       └── n<N>_k<K>/
 └── results/
     └── stats_<timestamp>.csv
 
@@ -41,14 +32,8 @@ Options
   --seed     INT                  Base seed                (default: 42)
   --timeout  INT                  Per-instance timeout (s) (default: 60)
   --outdir   PATH                 Results directory
-  --no-generate                   Skip generation; use existing .fzn files
-  --release                       Build solver with --release (recommended)
-  --run-sat                       Run SAT instances         (default: true)
-  --run-unsat-random              Run UNSAT random instances
-  --run-unsat-forced              Run UNSAT forced-partition instances
-  --unsat-nodes INT [INT ...]     Node counts for UNSAT    (default: 20 30)
-  --unsat-neighbours INT [INT ...]  k values for UNSAT     (default: 5 7)
-  --unsat-per-config INT          UNSAT instances per (n,k)(default: 5)
+  --no-generate                   Skip generation; use existing .mzn files
+  --solver   STR                  MiniZinc solver name     (default: pumpkin-circuit)
 """
 
 import argparse
@@ -64,12 +49,11 @@ from pathlib import Path
 # Paths
 # ---------------------------------------------------------------------------
 
-SCRIPT_DIR   = Path(__file__).parent
-PROJECT_ROOT = SCRIPT_DIR.parent
-SAT_GENERATOR   = SCRIPT_DIR / "generate_instances.py"
-UNSAT_GENERATOR = SCRIPT_DIR / "generate_unsat_instances.py"
-INSTANCE_DIR = SCRIPT_DIR / "instances"
-RESULTS_DIR  = SCRIPT_DIR / "results"
+SCRIPT_DIR    = Path(__file__).parent
+PROJECT_ROOT  = SCRIPT_DIR.parent
+SAT_GENERATOR = SCRIPT_DIR / "generate_instances.py"
+INSTANCE_DIR  = SCRIPT_DIR / "instances"
+RESULTS_DIR   = SCRIPT_DIR / "results"
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -95,34 +79,26 @@ def parse_statistics(raw: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Build solver binary once
+# Step 1 – Build solver binary
 # ---------------------------------------------------------------------------
 
-def build_solver(use_release: bool) -> Path:
+def build_solver() -> None:
     """
-    Run `cargo build -p pumpkin-solver [--release]` once and return the
-    path to the compiled binary.  This avoids per-instance Cargo startup
-    overhead contaminating wall-clock timing measurements.
+    Run `cargo build --release -p pumpkin-solver` once before the experiment
+    loop so the binary is up-to-date and Cargo startup overhead does not
+    contaminate per-instance wall-clock timings.
     """
-    cmd = ["cargo", "build", "-p", "pumpkin-solver"]
-    if use_release:
-        cmd.append("--release")
-
-    profile = "release" if use_release else "debug"
-    binary  = PROJECT_ROOT / "target" / profile / "pumpkin-solver"
-
-    print(f"\nBuilding pumpkin-solver ({profile})...")
+    cmd = ["cargo", "build", "--release", "-p", "pumpkin-solver"]
+    print("\nBuilding pumpkin-solver (release)...")
     stdout, stderr, rc = run(cmd, cwd=PROJECT_ROOT)
     if rc != 0:
         print(f"ERROR: cargo build failed:\n{stderr}", file=sys.stderr)
         sys.exit(1)
-
-    print(f"  Binary: {binary}")
-    return binary
+    print("  Build OK.\n")
 
 
 # ---------------------------------------------------------------------------
-# Step 1 – Generate instances
+# Step 2 – Generate instances
 # ---------------------------------------------------------------------------
 
 def generate_sat_instances(n, k, count, seed, out_dir):
@@ -132,56 +108,21 @@ def generate_sat_instances(n, k, count, seed, out_dir):
         "-n", str(n), "-k", str(k), "-c", str(count),
         "-s", str(seed), "-o", str(out_dir), "--prefix", "instance",
     ]
-    print(f"  [generate SAT] n={n} k={k} -> {out_dir}")
-    _, stderr, rc = run(cmd, cwd=PROJECT_ROOT)
-    if rc != 0:
-        print(f"    ERROR: {stderr}", file=sys.stderr)
-
-
-def generate_unsat_instances(n, k, count, seed, mode, out_dir):
-    out_dir.mkdir(parents=True, exist_ok=True)
-    cmd = [
-        sys.executable, str(UNSAT_GENERATOR),
-        "-n", str(n), "-k", str(k), "-c", str(count),
-        "-s", str(seed), "-o", str(out_dir),
-        "--unsat-mode", mode, "--prefix", "unsat",
-    ]
-    print(f"  [generate UNSAT/{mode}] n={n} k={k} -> {out_dir}")
+    print(f"  [generate] n={n} k={k} -> {out_dir}")
     _, stderr, rc = run(cmd, cwd=PROJECT_ROOT)
     if rc != 0:
         print(f"    ERROR: {stderr}", file=sys.stderr)
 
 
 # ---------------------------------------------------------------------------
-# Step 2 – MZN -> FZN
+# Step 2 – Solve with a single minizinc call
 # ---------------------------------------------------------------------------
 
-def convert_to_fzn(mzn_path: Path) -> Path | None:
-    fzn_path = mzn_path.with_suffix(".fzn")
-    rel_mzn  = mzn_path.relative_to(PROJECT_ROOT)
-    cmd = [
-        "minizinc", "--solver", "pumpkin",
-        "-c", "--no-output-ozn", str(rel_mzn),
-    ]
-    print(f"    [mzn->fzn] {rel_mzn.name}", end="  ")
-    _, stderr, rc = run(cmd, cwd=PROJECT_ROOT)
-    if rc != 0 or not fzn_path.exists():
-        print(f"FAILED (rc={rc})")
-        print(f"      stderr: {stderr[:300]}", file=sys.stderr)
-        return None
-    print(f"OK -> {fzn_path.name}")
-    return fzn_path
+def solve_mzn(mzn_path: Path, solver: str, timeout: int) -> dict:
+    rel_mzn = mzn_path.relative_to(PROJECT_ROOT)
+    cmd = ["minizinc", "--solver", solver, str(rel_mzn), "-s"]
 
-
-# ---------------------------------------------------------------------------
-# Step 3 – Solve using pre-built binary (no Cargo overhead)
-# ---------------------------------------------------------------------------
-
-def solve_fzn(fzn_path: Path, binary: Path, timeout: int) -> dict:
-    rel_fzn = fzn_path.relative_to(PROJECT_ROOT)
-    cmd = [str(binary), str(rel_fzn), "-s"]
-
-    print(f"    [solve]   {rel_fzn.name}", end="  ")
+    print(f"    [solve]  {rel_mzn.name}", end="  ")
     wall_start = time.perf_counter()
 
     try:
@@ -196,22 +137,24 @@ def solve_fzn(fzn_path: Path, binary: Path, timeout: int) -> dict:
     status = "timeout" if timed_out else ("ok" if rc == 0 else "error")
     print(f"{status}  ({wall_time:.3f}s)")
 
+    # MiniZinc prints stats to both stdout and stderr depending on version;
+    # parse both to be safe.
     stats = parse_statistics(stdout + stderr)
-    stats["wall_time_s"] = f"{wall_time:.6f}"
-    stats["status"]      = status
-    stats["return_code"] = str(rc)
+    stats["wall_time_s"]  = f"{wall_time:.6f}"
+    stats["status"]       = status
+    stats["return_code"]  = str(rc)
     return stats
 
 
 # ---------------------------------------------------------------------------
-# Step 4 – Persist results
+# Step 3 – Persist results
 # ---------------------------------------------------------------------------
 
 FIXED_COLUMNS = [
     "instance_type",
     "config_n", "config_k",
     "instance_index", "instance_seed",
-    "mzn_file", "fzn_file",
+    "mzn_file",
     "status", "return_code", "wall_time_s",
 ]
 
@@ -222,7 +165,7 @@ def save_results(rows, results_dir):
     csv_path  = results_dir / f"stats_{timestamp}.csv"
 
     extra_cols = sorted({k for row in rows for k in row if k not in FIXED_COLUMNS})
-    all_cols = FIXED_COLUMNS + extra_cols
+    all_cols   = FIXED_COLUMNS + extra_cols
 
     with open(csv_path, "w", newline="") as fh:
         writer = csv.DictWriter(fh, fieldnames=all_cols, extrasaction="ignore")
@@ -239,17 +182,15 @@ def save_results(rows, results_dir):
 # ---------------------------------------------------------------------------
 
 def run_config(
-    instance_type: str,
     n: int, k: int,
     config_dir: Path,
-    prefix: str,
     count: int,
-    binary: Path,
+    solver: str,
     timeout: int,
     seed: int,
 ) -> list[dict]:
-    rows = []
-    mzn_files = sorted(config_dir.glob(f"{prefix}_*.mzn"))[:count]
+    rows     = []
+    mzn_files = sorted(config_dir.glob("instance_*.mzn"))[:count]
 
     if not mzn_files:
         print(f"  No .mzn files found in {config_dir}, skipping.")
@@ -258,24 +199,19 @@ def run_config(
     for idx, mzn_path in enumerate(mzn_files):
         print(f"\n  Instance {idx} : {mzn_path.name}")
 
-        fzn_path = convert_to_fzn(mzn_path)
         row = {
-            "instance_type":  instance_type,
+            "instance_type":  "sat",
             "config_n":       n,
             "config_k":       k,
             "instance_index": idx,
             "instance_seed":  seed + idx,
             "mzn_file":       str(mzn_path.relative_to(PROJECT_ROOT)),
-            "fzn_file":       str(fzn_path.relative_to(PROJECT_ROOT)) if fzn_path else "",
         }
 
-        if fzn_path is None:
-            row["status"] = "fzn_conversion_failed"
-        else:
-            stats = solve_fzn(fzn_path, binary, timeout)
-            row.update(stats)
-
+        stats = solve_mzn(mzn_path, solver, timeout)
+        row.update(stats)
         rows.append(row)
+
     return rows
 
 
@@ -287,104 +223,48 @@ def parse_args():
     p = argparse.ArgumentParser(
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    p.add_argument("--nodes",      type=int, nargs="+", default=[10, 20, 30, 40, 50])
-    p.add_argument("--neighbours", type=int, nargs="+", default=[5, 7, 10])
+    p.add_argument("--nodes",                type=int, nargs="+", default=[10, 20, 30, 40, 50])
+    p.add_argument("--neighbours",           type=int, nargs="+", default=[5, 7, 10])
     p.add_argument("--instances-per-config", type=int, default=5)
-    p.add_argument("--seed",       type=int, default=42)
-    p.add_argument("--timeout",    type=int, default=60)
-    p.add_argument("--outdir",     type=Path, default=RESULTS_DIR)
-    p.add_argument("--no-generate", action="store_true")
-    p.add_argument("--release",    action="store_true")
-
-    # UNSAT controls
-    p.add_argument("--run-sat",           action="store_true", default=True)
-    p.add_argument("--run-unsat-random",  action="store_true", default=False)
-    p.add_argument("--run-unsat-forced",  action="store_true", default=False)
-    p.add_argument("--unsat-nodes",       type=int, nargs="+", default=[20, 30])
-    p.add_argument("--unsat-neighbours",  type=int, nargs="+", default=[5, 7])
-    p.add_argument("--unsat-per-config",  type=int, default=5)
-
+    p.add_argument("--seed",                 type=int, default=42)
+    p.add_argument("--timeout",              type=int, default=60)
+    p.add_argument("--outdir",               type=Path, default=RESULTS_DIR)
+    p.add_argument("--no-generate",          action="store_true")
+    p.add_argument("--solver",               type=str, default="pumpkin-circuit",
+                   help="MiniZinc solver name passed to --solver")
     return p.parse_args()
 
 
 def main():
     args = parse_args()
 
-    # Build solver binary once — critical for clean timing
-    binary = build_solver(args.release)
+    build_solver()
 
     all_rows = []
 
-    # ------------------------------------------------------------------ SAT
-    if args.run_sat:
-        for n in args.nodes:
-            for k in args.neighbours:
-                print(f"\n{'='*60}")
-                print(f"SAT  n={n}, k={k}")
-                print(f"{'='*60}")
-                config_dir = INSTANCE_DIR / "sat" / f"n{n}_k{k}"
-                if not args.no_generate:
-                    generate_sat_instances(n, k, args.instances_per_config,
-                                           args.seed, config_dir)
-                rows = run_config(
-                    instance_type="sat",
-                    n=n, k=k,
-                    config_dir=config_dir,
-                    prefix="instance",
-                    count=args.instances_per_config,
-                    binary=binary,
-                    timeout=args.timeout,
-                    seed=args.seed,
-                )
-                all_rows.extend(rows)
+    for n in args.nodes:
+        for k in args.neighbours:
+            print(f"\n{'='*60}")
+            print(f"n={n}, k={k}")
+            print(f"{'='*60}")
 
-    # ----------------------------------------------------------- UNSAT random
-    if args.run_unsat_random:
-        for n in args.unsat_nodes:
-            for k in args.unsat_neighbours:
-                print(f"\n{'='*60}")
-                print(f"UNSAT/random  n={n}, k={k}")
-                print(f"{'='*60}")
-                config_dir = INSTANCE_DIR / "unsat" / "random" / f"n{n}_k{k}"
-                if not args.no_generate:
-                    generate_unsat_instances(n, k, args.unsat_per_config,
-                                             args.seed, "random", config_dir)
-                rows = run_config(
-                    instance_type="unsat_random",
-                    n=n, k=k,
-                    config_dir=config_dir,
-                    prefix="unsat",
-                    count=args.unsat_per_config,
-                    binary=binary,
-                    timeout=args.timeout,
-                    seed=args.seed,
-                )
-                all_rows.extend(rows)
+            config_dir = INSTANCE_DIR / "sat" / f"n{n}_k{k}"
 
-    # ----------------------------------------------------------- UNSAT forced
-    if args.run_unsat_forced:
-        for n in args.unsat_nodes:
-            for k in args.unsat_neighbours:
-                print(f"\n{'='*60}")
-                print(f"UNSAT/forced  n={n}, k={k}")
-                print(f"{'='*60}")
-                config_dir = INSTANCE_DIR / "unsat" / "forced" / f"n{n}_k{k}"
-                if not args.no_generate:
-                    generate_unsat_instances(n, k, args.unsat_per_config,
-                                             args.seed, "forced", config_dir)
-                rows = run_config(
-                    instance_type="unsat_forced",
-                    n=n, k=k,
-                    config_dir=config_dir,
-                    prefix="unsat",
-                    count=args.unsat_per_config,
-                    binary=binary,
-                    timeout=args.timeout,
-                    seed=args.seed,
+            if not args.no_generate:
+                generate_sat_instances(
+                    n, k, args.instances_per_config, args.seed, config_dir
                 )
-                all_rows.extend(rows)
 
-    # ------------------------------------------------------------------ Save
+            rows = run_config(
+                n=n, k=k,
+                config_dir=config_dir,
+                count=args.instances_per_config,
+                solver=args.solver,
+                timeout=args.timeout,
+                seed=args.seed,
+            )
+            all_rows.extend(rows)
+
     if all_rows:
         save_results(all_rows, args.outdir)
     else:

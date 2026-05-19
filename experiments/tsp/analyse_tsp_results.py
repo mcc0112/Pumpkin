@@ -61,8 +61,8 @@ RUNTIME_COL     = "solveTime"
 SEARCH_COL      = "failures"
 EXPLANATION_COL = "AverageLbd"
 
-LABEL_BASELINE  = "baseline"
-LABEL_NEW       = "new"
+LABEL_BASELINE  = "Decomposed"
+LABEL_NEW       = "Variant 1"
 COLORS          = {LABEL_BASELINE: "#4C72B0", LABEL_NEW: "#DD8452"}
 
 # Instances are identified by this column (written by run_tsp_experiments.py)
@@ -359,7 +359,7 @@ def main() -> None:
     plot_metric(
         df_base, df_new,
         col      = RUNTIME_COL,
-        ylabel   = "Wall-clock time (s)",
+        ylabel   = "Solve time(s)",
         title    = f"Runtime per TSP instance  [{LABEL_BASELINE} vs {LABEL_NEW}]",
         filename = "plot_tsp_runtime.png",
         out_dir  = args.out,
@@ -375,7 +375,7 @@ def main() -> None:
     plot_metric(
         df_base, df_new,
         col      = EXPLANATION_COL,
-        ylabel   = "noGoods generated",
+        ylabel   = "Average LBD",
         title    = f"Explanation overhead per instance  [{LABEL_BASELINE} vs {LABEL_NEW}]",
         filename = "plot_tsp_explanation.png",
         out_dir  = args.out,
