@@ -611,7 +611,7 @@ impl<Var: IntegerVariable + 'static> AllDifferentPropagator<Var> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pumpkin_core::state::State;
+    use pumpkin_core::{state::State, variables::DomainId};
 
     fn make_state(domains: &[(i32, i32)]) -> State {
         let mut state = State::default();
@@ -626,6 +626,7 @@ mod tests {
         });
         state
     }
+    
 
     #[test]
     fn no_conflict_all_distinct_fixed() {
@@ -756,6 +757,185 @@ mod tests {
         assert!(
             state.propagate_to_fixed_point().is_err(),
             "subset of 3 vars crowding 2 values is a Hall violation even with other vars present"
+        );
+    }
+    fn make_state_get_vars(domains: &[(i32, i32)]) -> (State, Box<[DomainId]>) {
+        let mut state = State::default();
+        let vars: Box<[_]> = domains
+            .iter()
+            .map(|&(lo, hi)| state.new_interval_variable(lo, hi, None))
+            .collect();
+        let tag = state.new_constraint_tag();
+        let _ = state.add_propagator(AllDifferentConstructor {
+            sucs: vars.clone(),
+            constraint_tag: tag,
+        });
+        (state, vars)
+    }
+
+    // ── Test 1 ──────────────────────────────────────────────────────────────────
+    // y is fixed to 1, so 1 must be pruned from x. Value 3 in z is untouched.
+    #[test]
+    fn alldiff_prune_fixed_var_removes_value_from_peer() {
+        let (mut state, vars) = make_state_get_vars(&[(1, 2), (1, 1), (1, 3)]);
+        let _ = state.propagate_to_fixed_point();
+        let domains = state.get_domains();
+
+        assert!(
+            !domains.contains(&vars[0], 1),
+            "y is fixed to 1, so 1 must be pruned from x"
+        );
+        assert!(
+            domains.contains(&vars[2], 3),
+            "value 3 is not used by any fixed var and must stay in z"
+        );
+    }
+
+    // ── Test 2 ──────────────────────────────────────────────────────────────────
+    // Both x and y have domain {1,2}. Both values appear in some maximum matching,
+    // so neither should be pruned from either variable.
+    #[test]
+    fn alldiff_prune_symmetric_pair_no_pruning() {
+        let (mut state, vars) = make_state_get_vars(&[(1, 2), (1, 2)]);
+        let _ = state.propagate_to_fixed_point();
+        let domains = state.get_domains();
+
+        for val in [1, 2] {
+            assert!(
+                domains.contains(&vars[0], val),
+                "x must still contain {val}: it appears in a valid matching"
+            );
+            assert!(
+                domains.contains(&vars[1], val),
+                "y must still contain {val}: it appears in a valid matching"
+            );
+        }
+    }
+
+    // ── Test 3 ──────────────────────────────────────────────────────────────────
+    // Staircase domains. Every edge lies on some augmenting path, so no pruning
+    // should occur — this checks the propagator does not over-prune.
+    #[test]
+    fn alldiff_prune_staircase_no_over_pruning() {
+        let (mut state, vars) = make_state_get_vars(&[(1, 2), (2, 3), (3, 4)]);
+        let _ = state.propagate_to_fixed_point();
+        let domains = state.get_domains();
+
+        assert!(
+            domains.contains(&vars[0], 2),
+            "value 2 is in x's domain and lies on an augmenting path — must not be pruned"
+        );
+        assert!(
+            domains.contains(&vars[2], 4),
+            "value 4 is exclusively reachable by z — must not be pruned"
+        );
+    }
+
+    // ── Test 4 ──────────────────────────────────────────────────────────────────
+    // x and y together form a Hall set over {1,2}. z must take 3 — so 1 and 2
+    // must be pruned from z's domain. This is the core SCC pruning case.
+    #[test]
+    fn alldiff_prune_hall_pair_forces_third_var() {
+        let (mut state, vars) = make_state_get_vars(&[(1, 2), (1, 2), (1, 3)]);
+        let _ = state.propagate_to_fixed_point();
+        let domains = state.get_domains();
+
+        assert!(
+            !domains.contains(&vars[2], 1),
+            "x and y exhaust value 1 must be pruned from z"
+        );
+        assert!(
+            !domains.contains(&vars[2], 2),
+            "x and y exhaust : value 2 must be pruned from z"
+        );
+        assert!(
+            domains.contains(&vars[2], 3),
+            "value 3 is the only remaining option for z and must be preserved"
+        );
+    }
+
+    // ── Test 5 ──────────────────────────────────────────────────────────────────
+    // z has a wide domain including value 4, which only z can take.
+    // Because 4 is exclusively z's, it lies in z's SCC and must NOT be pruned.
+    #[test]
+    fn alldiff_prune_exclusive_value_in_wide_domain_preserved() {
+        let (mut state, vars) = make_state_get_vars(&[(1, 2), (2, 3), (1, 4)]);
+        let _ = state.propagate_to_fixed_point();
+        let domains = state.get_domains();
+
+        assert!(
+            domains.contains(&vars[2], 4),
+            "value 4 is only reachable by z — it must not be pruned even though z's domain is wide"
+        );
+        assert!(
+            domains.contains(&vars[2], 3),
+            "value 3 is also reachable by z via an augmenting path — must be kept"
+        );
+    }
+
+    // ── Test 6 ──────────────────────────────────────────────────────────────────
+    // x is fixed to 3. y has domain {1,3}. Value 3 is consumed by x, so it must
+    // be pruned from y. Value 1 must survive.
+    #[test]
+    fn alldiff_prune_fixed_var_removes_its_value_from_peer_domain() {
+        let (mut state, vars) = make_state_get_vars(&[(3, 3), (1, 3), (1, 2)]);
+        let _ = state.propagate_to_fixed_point();
+        let domains = state.get_domains();
+
+        assert!(
+            !domains.contains(&vars[1], 3),
+            "x is fixed to 3, so 3 must be pruned from y"
+        );
+        assert!(
+            domains.contains(&vars[1], 1),
+            "value 1 is not taken by any fixed var and must remain in y"
+        );
+    }
+
+    // ── Test 7 ──────────────────────────────────────────────────────────────────
+    // Three vars, three vals, full domains. Every (var, val) pair lies on some
+    // maximum matching, so every value belongs to the same SCC as its variable.
+    // Nothing should be pruned — directly analogous to the circuit test that
+    // checks the "closing edge" is not wrongly pruned.
+    #[test]
+    fn alldiff_prune_full_latin_square_no_pruning() {
+        let (mut state, vars) = make_state_get_vars(&[(1, 3), (1, 3), (1, 3)]);
+        let _ = state.propagate_to_fixed_point();
+        let domains = state.get_domains();
+
+        for (i, var) in vars.iter().enumerate() {
+            for val in 1..=3 {
+                assert!(
+                    domains.contains(var, val),
+                    "var[{i}] should still contain {val}: every assignment is part of some matching"
+                );
+            }
+        }
+    }
+
+    // ── Test 8 ──────────────────────────────────────────────────────────────────
+    // The direct AllDifferent analogue of the circuit "closing Hamiltonian edge"
+    // test: x=1 and y=2 are fixed, z∈{1,2,3}. Values 1 and 2 are consumed;
+    // value 3 is the only one that completes the assignment — it must NOT be
+    // pruned. Values 1 and 2 in z MUST be pruned.
+    #[test]
+    fn alldiff_prune_only_completing_value_preserved() {
+        let (mut state, vars) = make_state_get_vars(&[(1, 1), (2, 2), (1, 3)]);
+        let _ = state.propagate_to_fixed_point();
+        let domains = state.get_domains();
+
+        assert!(
+            !domains.contains(&vars[2], 1),
+            "value 1 is consumed by x=1 and must be pruned from z"
+        );
+        assert!(
+            !domains.contains(&vars[2], 2),
+            "value 2 is consumed by y=2 and must be pruned from z"
+        );
+        assert!(
+            domains.contains(&vars[2], 3),
+            "value 3 is the only completing assignment for z — must NOT be pruned, \
+            analogous to the closing Hamiltonian edge in the circuit test"
         );
     }
 }
