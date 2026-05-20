@@ -99,8 +99,8 @@ FLAT_COLS: dict[str, tuple[str, str, str]] = {
     "flat_time"       : ("flatTime",           "Flattening time (s)",      "lower is better"),
 }
 
-LABEL_BASELINE = "baseline"
-LABEL_NEW      = "new"
+LABEL_BASELINE = "Decomposed"
+LABEL_NEW      = "Variant 1"
 COLORS         = {LABEL_BASELINE: "#4C72B0", LABEL_NEW: "#DD8452"}
 
 # ---------------------------------------------------------------------------
@@ -217,13 +217,13 @@ def _grouped_bar_with_points(
     ax.bar(x + width/2, new_vals,  width, label=LABEL_NEW,
            color=COLORS[LABEL_NEW],      alpha=0.82, zorder=2)
 
-    for i, cfg in enumerate(all_configs):
-        for offset, raw_dict in [(-width/2, base_raw), (+width/2, new_raw)]:
-            pts = raw_dict.get(cfg, [])
-            if pts:
-                jitter = rng.uniform(-0.07, 0.07, len(pts))
-                ax.scatter(np.full(len(pts), x[i] + offset) + jitter, pts,
-                           color="black", s=20, alpha=0.5, zorder=3)
+    # for i, cfg in enumerate(all_configs):
+    #     for offset, raw_dict in [(-width/2, base_raw), (+width/2, new_raw)]:
+    #         pts = raw_dict.get(cfg, [])
+    #         if pts:
+    #             jitter = rng.uniform(-0.07, 0.07, len(pts))
+    #             ax.scatter(np.full(len(pts), x[i] + offset) + jitter, pts,
+    #                        color="black", s=20, alpha=0.5, zorder=3)
 
     ax.set_xticks(x)
     ax.set_xticklabels(configs, fontsize=8, rotation=30, ha="right")
