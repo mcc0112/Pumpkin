@@ -1,3 +1,4 @@
+
 use pumpkin_core::declare_inference_label;
 use pumpkin_core::proof::ConstraintTag;
 use pumpkin_core::proof::InferenceCode;
@@ -23,7 +24,7 @@ use crate::all_different::AllDifferentChecker;
 pub struct AllDifferentConstructor<Var> {
     pub sucs: Box<[Var]>,
     pub constraint_tag: ConstraintTag,
-}
+}//
 declare_inference_label!(AllDifferent);
 
 impl<Var: IntegerVariable + 'static> PropagatorConstructor for AllDifferentConstructor<Var> {
@@ -100,6 +101,10 @@ struct BipartiteGraph {
 
 impl BipartiteGraph {
     fn build<Var: IntegerVariable>(successors: &[Var], domains: &Domains) -> Self {
+        //safety check just to make sure the min/max never operate on an empty iterator
+        if successors.is_empty() {
+            return BipartiteGraph { n_vars: 0, n_vals: 0, adj: Vec::new(), val_offset: 0 }
+        }
         let val_offset = successors
             .iter()
             .map(|v| domains.lower_bound(v))
@@ -115,8 +120,6 @@ impl BipartiteGraph {
         let n_vars = successors.len();
         let n_vals = (max_val - val_offset + 1) as usize;
 
-        // OPTIMISATION 1: pre-size each inner Vec to the variable's domain
-        // width so it never needs to reallocate as values are pushed.
         let mut adj: Vec<Vec<usize>> = successors
             .iter()
             .map(|v| {
@@ -146,37 +149,33 @@ const INF_DIST: usize = usize::MAX;
 struct Matching {
     /// match_var[i] = value-index matched to variable i, or UNMATCHED.
     match_var: Vec<usize>,
-    /// OPTIMISATION 3: use HashMap instead of a dense Vec so that wide but
-    /// sparse domains (e.g. domain {1, 1000}) don't allocate 1000 slots.
-    match_val: std::collections::HashMap<usize, usize>,
+    match_val: Vec<usize>,
     size: usize,
 }
 
 impl Matching {
-    fn new(n_vars: usize) -> Self {
+    fn new(n_vars: usize, n_vals: usize) -> Self {
         Matching {
             match_var: vec![UNMATCHED; n_vars],
-            // Pre-size the map to the number of variables — the maximum
-            // number of matched value-nodes can never exceed n_vars.
-            match_val: std::collections::HashMap::with_capacity(n_vars),
+            match_val: vec![UNMATCHED; n_vals],
             size: 0,
         }
     }
 
     #[inline]
     fn get_match_val(&self, v: usize) -> usize {
-        self.match_val.get(&v).copied().unwrap_or(UNMATCHED)
+        self.match_val[v]
     }
 
     #[inline]
     fn set_match_val(&mut self, v: usize, var: usize) {
-        self.match_val.insert(v, var);
+        self.match_val[v] = var;
     }
 }
 
 fn hopcroft_karp(graph: &BipartiteGraph) -> Matching {
     // OPTIMISATION 3: Matching no longer takes n_vals.
-    let mut m = Matching::new(graph.n_vars);
+    let mut m = Matching::new(graph.n_vars, graph.n_vals);
 
     loop {
         // ---- BFS phase: build layered graph of shortest augmenting paths ----
@@ -209,38 +208,71 @@ fn hopcroft_karp(graph: &BipartiteGraph) -> Matching {
 
         // ---- DFS phase: augmentation ----
         for i in 0..graph.n_vars {
-            if m.match_var[i] == UNMATCHED && dfs_augment(i, graph, &mut m, &mut dist) {
-                m.size += 1;
+            if m.match_var[i] == UNMATCHED && dfs_augment_iterative(i, graph, &mut m, &mut dist) {
+                m.size +=1;
             }
         }
     }
 
     m
 }
-
-fn dfs_augment(
-    i: usize,
-    graph: &BipartiteGraph,
-    m: &mut Matching,
+//used iterative appraoche instead of recursive with explicit stack so that large isntances cannot 
+//overflow. Algotith - follow admissble edges in teh layered graph and augement the first free path
+fn dfs_augment_iterative (
+    start: usize, 
+    graph: &BipartiteGraph, 
+    m: &mut Matching, 
     dist: &mut [usize],
 ) -> bool {
-    for &v in &graph.adj[i] {
-        let next = m.get_match_val(v);
-        let admissible = next == UNMATCHED
-            || (dist[next] != INF_DIST && dist[next] == dist[i] + 1);
-
-        if admissible {
-            let augmented = next == UNMATCHED || dfs_augment(next, graph, m, dist);
-            if augmented {
-                m.match_var[i] = v;
-                m.set_match_val(v, i);
-                dist[i] = INF_DIST;
-                return true;
+    let mut call_stack: Vec<(usize, usize)> = vec![(start, 0)];
+    let mut result_stack: Vec<bool> = vec![false];
+    while let Some(frame) = call_stack.last_mut() {
+        let (i, ei) = *frame;
+        if ei >= graph.adj[i].len() {
+            call_stack.pop();
+            result_stack.pop();
+            if let Some(parent_result) = result_stack.last_mut() {
+                let _ = parent_result;
             }
+            dist[i] = INF_DIST;
+            continue;
         }
+        let v = graph.adj[i][ei];
+        frame.1 += 1;
+        let next = m.get_match_val(v);
+        let admissible = next == UNMATCHED ||
+            (dist[next] != INF_DIST && dist[next] == dist[i] +1);
+        
+        if !admissible {
+            continue;
+        }
+        if next == UNMATCHED {
+            m.match_var[i] = v;
+            m.set_match_val(v, i);
+            dist[i] = INF_DIST;
+            *result_stack.last_mut().unwrap() = true;
+            call_stack.pop();
+        
+            while let Some (&(pi, _)) = call_stack.last() {
+                let pv = m.match_var[pi];
+                let _ = pv; 
+                let parent_ei = call_stack.last().unwrap().1 -1;
+                let taken_v = graph.adj[pi][parent_ei];
+                m.match_var[pi] = taken_v;
+                m.set_match_val(taken_v, pi);
+                dist[pi] = INF_DIST;
+                call_stack.pop();
+                result_stack.pop();
+
+            }
+            return true;
+        }
+        call_stack.push((next, 0));
+        result_stack.push(false);
     }
-    dist[i] = INF_DIST;
     false
+
+    
 }
 
 // ============================
@@ -257,6 +289,10 @@ fn find_hall_set(graph: &BipartiteGraph, m: &Matching) -> (Vec<usize>, Vec<usize
             var_visited[i] = true;
             queue.push_back(i);
         }
+    }
+    //if no unmatched variable 0 essentailly a check:
+    if queue.is_empty() {
+        return (Vec::new(), Vec::new());
     }
 
     while let Some(i) = queue.pop_front() {
@@ -290,7 +326,7 @@ fn find_hall_set(graph: &BipartiteGraph, m: &Matching) -> (Vec<usize>, Vec<usize
 // ============================
 
 struct ResidualGraph {
-    n_nodes: usize,
+    n_nodes: usize,  // n_vars + n_vals + 1 (the +1 is T)
     adj: Vec<Vec<usize>>,
 }
 
@@ -298,26 +334,30 @@ impl ResidualGraph {
     fn build(graph: &BipartiteGraph, m: &Matching) -> Self {
         let n_vars = graph.n_vars;
         let n_vals = graph.n_vals;
-        let n_nodes = n_vars + n_vals;
+        // Add one extra node: T (the virtual "free values" node)
+        let t_node = n_vars + n_vals;
+        let n_nodes = n_vars + n_vals + 1;
 
-        // OPTIMISATION 2: pre-size var-nodes to their domain size; val-nodes
-        // to 1 since each can only have one matched back-arc.
         let mut adj: Vec<Vec<usize>> = (0..n_nodes)
             .map(|i| {
                 if i < n_vars {
                     Vec::with_capacity(graph.adj[i].len())
+                } else if i == t_node {
+                    // T → every variable: capacity n_vars
+                    Vec::with_capacity(n_vars)
                 } else {
                     Vec::with_capacity(1)
                 }
             })
             .collect();
 
+        // Build matched/unmatched residual edges (unchanged)
         for i in 0..n_vars {
             for &v in &graph.adj[i] {
                 let var_node = i;
                 let val_node = n_vars + v;
                 if m.match_var[i] == v {
-                    // Matched edge: value → variable
+                    // Matched edge reversed: value → variable
                     adj[val_node].push(var_node);
                 } else {
                     // Unmatched edge: variable → value
@@ -325,9 +365,29 @@ impl ResidualGraph {
                 }
             }
         }
+
+        // Connect free (unmatched) values through T
+        //   free_val_node → T       (any path reaching a free value can continue)
+        //   T → every variable      (T can re-enter the variable layer anywhere)
+        for v in 0..n_vals {
+            if m.get_match_val(v) == UNMATCHED {
+                let val_node = n_vars + v;
+                adj[val_node].push(t_node);   // free value → T
+            }
+        }
+        // Only add T→var edges if T actually has incoming edges (i.e. there are free values).
+        // This avoids polluting the SCC analysis when all values are matched.
+        let has_free_vals = (0..n_vals).any(|v| m.get_match_val(v) == UNMATCHED);
+        if has_free_vals {
+            for i in 0..n_vars {
+                adj[t_node].push(i);          // T → variable i
+            }
+        }
+
         ResidualGraph { n_nodes, adj }
     }
 }
+
 
 // ============================
 // STEP 5 - Tarjan's SCC
@@ -342,7 +402,6 @@ struct TarjanState {
     index:    usize,
     stack:    Vec<usize>,
     on_stack: Vec<bool>,
-    /// OPTIMISATION 4: flat sentinel-based vec instead of Vec<Option<usize>>.
     indices:  Vec<usize>,
     lowlinks: Vec<usize>,
     scc_id:   Vec<usize>,
@@ -440,6 +499,11 @@ impl<Var: IntegerVariable + 'static> AllDifferentPropagator<Var> {
     fn check_conflict_and_propgate(&self, mut context: PropagationContext) -> PropagationStatusCP {
         let domains = context.domains();
 
+        //early resturn - just in case
+        if self.sucs.is_empty() {
+            return Ok(());
+        }
+
         // Step 1: build bipartite graph
         let graph = BipartiteGraph::build(&self.sucs, &domains);
 
@@ -449,6 +513,7 @@ impl<Var: IntegerVariable + 'static> AllDifferentPropagator<Var> {
         // Step 3: conflict check — if no perfect matching, find Hall set and raise conflict
         if matching.size < graph.n_vars {
             let (hall_vars, hall_vals) = find_hall_set(&graph, &matching);
+
             let conjunction = self.make_hall_explanation(
                 domains, &graph, &hall_vars, &hall_vals,
             );
@@ -484,10 +549,8 @@ impl<Var: IntegerVariable + 'static> AllDifferentPropagator<Var> {
                     let explanation = self.make_pruning_explanation(
                         &domains,
                         &graph,
-                        &scc_id,
                         i,
                         v,
-                        &matching,
                     );
                     prunings.push((i, domain_val, explanation));
                 }
@@ -497,6 +560,8 @@ impl<Var: IntegerVariable + 'static> AllDifferentPropagator<Var> {
         for (var_idx, domain_val, reason) in prunings {
             let var = &self.sucs[var_idx];
             if context.contains(var, domain_val) {
+                // println!("Pruning, reason: {:?}", reason);
+                // println!("Pruning, consequence: {:?} != {}", var, domain_val);
                 context.post(
                     predicate!(var != domain_val),
                     reason,
@@ -549,59 +614,42 @@ impl<Var: IntegerVariable + 'static> AllDifferentPropagator<Var> {
             })
             .collect()
     }
+fn make_pruning_explanation(
+    &self,
+    domains: &Domains,
+    graph: &BipartiteGraph,
+    var_idx: usize,
+    pruned_val_idx: usize,
+) -> PropositionalConjunction {
 
-    fn make_pruning_explanation(
-        &self,
-        domains: &Domains,
-        graph: &BipartiteGraph,
-        scc_id: &[usize],
-        var_idx: usize,
-        pruned_val_idx: usize,
-        matching: &Matching,
-    ) -> PropositionalConjunction {
-        let xi_scc = scc_id[var_idx];
+    let mut lits = Vec::new();
 
-        let scc_vars: Vec<usize> = (0..graph.n_vars)
-            .filter(|&j| scc_id[j] == xi_scc)
-            .collect();
+    for i in 0..graph.n_vars {
+        let var = &self.sucs[i];
 
-        let n_s: std::collections::HashSet<usize> = (0..graph.n_vals)
-            .filter(|&v| scc_id[graph.n_vars + v] == xi_scc)
-            .collect();
+        // If fixed -> exact equality
+        if let Some(fixed) = domains.fixed_value(var) {
+            lits.push(predicate!(var == fixed));
+            continue;
+        }
 
-        let lits: Vec<_> = scc_vars
-            .iter()
-            .flat_map(|&j| {
-                let var = &self.sucs[j];
-                let lb = domains.lower_bound(var);
-                let ub = domains.upper_bound(var);
+        // Otherwise encode the ENTIRE current domain.
+        let lb = domains.lower_bound(var);
+        let ub = domains.upper_bound(var);
 
-                if let Some(fv) = domains.fixed_value(var) {
-                    vec![predicate!(var == fv)]
-                } else {
-                    let mut v_lits = vec![
-                        predicate!(var >= lb),
-                        predicate!(var <= ub),
-                    ];
-                    for v_idx in 0..graph.n_vals {
-                        if n_s.contains(&v_idx) {
-                            continue;
-                        }
-                        let dv = v_idx as i32 + graph.val_offset;
-                        if dv <= lb || dv >= ub {
-                            continue;
-                        }
-                        if !domains.contains(var, dv) {
-                            v_lits.push(predicate!(var != dv));
-                        }
-                    }
-                    v_lits
-                }
-            })
-            .collect();
+        lits.push(predicate!(var >= lb));
+        lits.push(predicate!(var <= ub));
 
-        lits.into_iter().collect()
+        // Add holes.
+        for val in lb..=ub {
+            if !domains.contains(var, val) {
+                lits.push(predicate!(var != val));
+            }
+        }
     }
+
+    lits.into_iter().collect()
+}
 }
 
 // ============================
