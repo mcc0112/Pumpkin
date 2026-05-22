@@ -321,6 +321,63 @@ fn find_hall_set(graph: &BipartiteGraph, m: &Matching) -> (Vec<usize>, Vec<usize
     (hall_vars, hall_vals)
 }
 
+fn find_pruning_hall_set(
+    graph: &BipartiteGraph,
+    m: &Matching,
+    pruned_var: usize,
+    pruned_val: usize,
+) -> (Vec<usize>, Vec<usize>) {
+    let old_m = m.match_val[pruned_val];
+    debug_assert!(old_m != UNMATCHED, "pruned value must be matched");
+
+    let mut var_visited = vec![false; graph.n_vars];
+    let mut val_visited = vec![false; graph.n_vals];
+    let mut queue = std::collections::VecDeque::new();
+
+    // Start BFS from the variable currently matched to pruned_val
+    var_visited[old_m] = true;
+    queue.push_back(old_m);
+
+    while let Some(h) = queue.pop_front() {
+        for &v in &graph.adj[h] {
+            if val_visited[v] {
+                continue;
+            }
+            val_visited[v] = true;
+
+            // Never route through pruned_val back to pruned_var.
+            // pruned_val is in V (it gets collected below) but the BFS
+            // must not follow it to pruned_var, which is outside H.
+            if v == pruned_val {
+                continue;
+            }
+
+            let next = m.match_val[v];
+            if next != UNMATCHED && !var_visited[next] {
+                var_visited[next] = true;
+                queue.push_back(next);
+            }
+        }
+    }
+
+    // H = variables visited (excludes pruned_var by construction)
+    // V = values visited (includes pruned_val since val_visited[pruned_val] = true)
+    let hall_vars: Vec<usize> = (0..graph.n_vars)
+        .filter(|&h| var_visited[h])
+        .collect();
+    let hall_vals: Vec<usize> = (0..graph.n_vals)
+        .filter(|&v| val_visited[v])
+        .collect();
+
+    debug_assert!(
+        hall_vars.len() == hall_vals.len(),
+        "tight Hall set must have |H| = |V|, got |H|={} |V|={}",
+        hall_vars.len(), hall_vals.len()
+    );
+
+    (hall_vars, hall_vals)
+}
+
 // ============================
 // STEP 4 - Residual Graph + Tarjan's SCC
 // ============================
@@ -515,7 +572,7 @@ impl<Var: IntegerVariable + 'static> AllDifferentPropagator<Var> {
             let (hall_vars, hall_vals) = find_hall_set(&graph, &matching);
 
             let conjunction = self.make_hall_explanation(
-                domains, &graph, &hall_vars, &hall_vals,
+                &domains, &graph, &hall_vars, &hall_vals,
             );
             return Err(Conflict::Propagator(PropagatorConflict {
                 conjunction,
@@ -533,35 +590,35 @@ impl<Var: IntegerVariable + 'static> AllDifferentPropagator<Var> {
         // OPTIMISATION: pre-size with a lower-bound capacity to avoid repeated growth.
         let mut prunings: Vec<(usize, i32, PropositionalConjunction)> =
             Vec::with_capacity(graph.n_vars);
-
+        // In check_conflict_and_propgate, pruning loop:
         for i in 0..graph.n_vars {
-            let var_node = i;
             let matched_val = matching.match_var[i];
-
             for &v in &graph.adj[i] {
-                if v == matched_val {
-                    continue;
-                }
+                if v == matched_val { continue; }
                 let val_node = graph.n_vars + v;
+                if scc_id[i] == scc_id[val_node] { continue; }
 
-                if scc_id[var_node] != scc_id[val_node] {
-                    let domain_val = v as i32 + graph.val_offset;
-                    let explanation = self.make_pruning_explanation(
-                        &domains,
-                        &graph,
-                        i,
-                        v,
-                    );
-                    prunings.push((i, domain_val, explanation));
-                }
+                let domain_val = v as i32 + graph.val_offset;
+
+                // find_pruning_hall_set gives us H (hall_vars) and V (hall_vals)
+                // H is confined to V, v is in V, so xi cannot take v
+                let (hall_vars, hall_vals) = find_pruning_hall_set(
+                    &graph, &matching, i, v
+                );
+
+                let explanation = self.make_pruning_explanation_from_hall(
+                    &domains,
+                    &graph,
+                    &hall_vars,
+                    &hall_vals,
+                );
+                prunings.push((i, domain_val, explanation));
             }
         }
 
         for (var_idx, domain_val, reason) in prunings {
             let var = &self.sucs[var_idx];
             if context.contains(var, domain_val) {
-                // println!("Pruning, reason: {:?}", reason);
-                // println!("Pruning, consequence: {:?} != {}", var, domain_val);
                 context.post(
                     predicate!(var != domain_val),
                     reason,
@@ -575,81 +632,178 @@ impl<Var: IntegerVariable + 'static> AllDifferentPropagator<Var> {
 
     fn make_hall_explanation(
         &self,
-        domains: Domains,
+        domains: &Domains,
         graph: &BipartiteGraph,
         hall_vars: &[usize],
         hall_vals: &[usize],
     ) -> PropositionalConjunction {
-        let hall_val_set: std::collections::HashSet<usize> =
-            hall_vals.iter().copied().collect();
+        let in_hall_vals: Vec<bool> = {
+            let mut v = vec![false; graph.n_vals];
+            for &val_idx in hall_vals {v[val_idx] = true;}
+            v
+        };
 
         hall_vars
             .iter()
-            .flat_map(|&i| {
-                let var = &self.sucs[i];
+            .flat_map(|&h| {
+                let var = &self.sucs[h];
+                if let Some (fixed) = domains.fixed_value(var) {
+                    return vec![predicate!(var == fixed)];
+                }
+
                 let lb = domains.lower_bound(var);
                 let ub = domains.upper_bound(var);
 
-                if let Some(fixed_val) = domains.fixed_value(var) {
-                    vec![predicate!(var == fixed_val)]
-                } else {
-                    let mut lits = vec![
-                        predicate!(var >= lb),
-                        predicate!(var <= ub),
-                    ];
-                    for v_idx in 0..graph.n_vals {
-                        if hall_val_set.contains(&v_idx) {
-                            continue;
-                        }
-                        let domain_val = v_idx as i32 + graph.val_offset;
-                        if domain_val <= lb || domain_val >= ub {
-                            continue;
-                        }
-                        if !domains.contains(var, domain_val) {
-                            lits.push(predicate!(var != domain_val));
-                        }
+                let mut lits = vec![predicate!(var >= lb), predicate!(var <= ub)];
+
+                for d_idx in 0..graph.n_vals {
+                    if in_hall_vals[d_idx] {continue;}
+                    let d = d_idx as i32 + graph.val_offset;
+                    if d <= lb || d >= ub {continue;}
+
+                    if !domains.contains(var, d) {
+                        lits.push(predicate!(var != d));
                     }
-                    lits
+
                 }
+                lits
             })
             .collect()
     }
-fn make_pruning_explanation(
-    &self,
-    domains: &Domains,
-    graph: &BipartiteGraph,
-    var_idx: usize,
-    pruned_val_idx: usize,
-) -> PropositionalConjunction {
+    /// Build a minimal explanation for the pruning of value `pruned_val_idx`
+    /// from variable `var_idx`.
+    ///
+    /// Following Downing, Feydy & Stuckey (2012), equation (1):
+    ///
+    ///   ∧_{h ∈ H, d ∈ E \ V}  [x_h ≠ d]  →  [x_i ≠ j]
+    ///
+    /// where H and V are extracted from the SCC of `val_node` in the residual
+    /// graph:
+    ///   H = { variable nodes in scc(val_node) }
+    ///   V = { value nodes    in scc(val_node) }  (stripping the n_vars offset)
+    ///
+    /// Intuitively: the SCC reveals a tight Hall set — the variables in H are
+    /// collectively confined to the values in V (|H| = |V| in a saturated
+    /// matching). The pruned value j lies in V, so x_i (which is *not* in H)
+    /// cannot use j.
+    ///
+    /// As in make_hall_explanation, V = N(H) by the Hall set property, so
+    /// every [x_h ≠ d] for d ∈ E\V is already a fact in the current domain.
+    fn make_pruning_explanation(
+        &self,
+        domains: &Domains,
+        graph: &BipartiteGraph,
+        scc_id: &[usize],
+        val_node: usize,
+    ) -> PropositionalConjunction {
+        let target_scc = scc_id[val_node];
+        let n_vars = graph.n_vars;
 
-    let mut lits = Vec::new();
-
-    for i in 0..graph.n_vars {
-        let var = &self.sucs[i];
-
-        // If fixed -> exact equality
-        if let Some(fixed) = domains.fixed_value(var) {
-            lits.push(predicate!(var == fixed));
-            continue;
-        }
-
-        // Otherwise encode the ENTIRE current domain.
-        let lb = domains.lower_bound(var);
-        let ub = domains.upper_bound(var);
-
-        lits.push(predicate!(var >= lb));
-        lits.push(predicate!(var <= ub));
-
-        // Add holes.
-        for val in lb..=ub {
-            if !domains.contains(var, val) {
-                lits.push(predicate!(var != val));
+        // Collect which value indices are in the target SCC
+        let in_val_scc: Vec<bool> = {
+            let mut v = vec![false; graph.n_vals];
+            for val_idx in 0..graph.n_vals {
+                let node = n_vars + val_idx;
+                if scc_id[node] == target_scc {
+                    v[val_idx] = true;
+                }
             }
-        }
+            v
+        };
+
+        // For each variable h in the tight SCC, describe its confinement
+        // using only bounds and holes that existed at propagation entry.
+        // Critically: only emit [xh != d] for values d that were already
+        // absent from D(xh) when propagation started — never for values
+        // removed during this propagation call.
+        (0..n_vars)
+            .filter(|&h| scc_id[h] == target_scc)
+            .flat_map(|h| {
+                let var = &self.sucs[h];
+                let lb = domains.lower_bound(var);
+                let ub = domains.upper_bound(var);
+
+                let mut lits = vec![
+                    predicate!(var >= lb),
+                    predicate!(var <= ub),
+                ];
+
+                // Only emit hole literals for values inside the SCC range
+                // that are genuinely absent — these were absent at entry
+                // since we read from the pre-pruning domain snapshot.
+                for val_idx in 0..graph.n_vals {
+                    if in_val_scc[val_idx] {
+                        continue; // value is in the tight set, skip
+                    }
+                    let d = val_idx as i32 + graph.val_offset;
+                    if d <= lb || d >= ub {
+                        continue; // already excluded by bounds
+                    }
+                    if !domains.contains(var, d) {
+                        lits.push(predicate!(var != d));
+                    }
+                }
+                lits
+            })
+            .collect()
     }
 
-    lits.into_iter().collect()
-}
+    fn make_pruning_explanation_from_hall(
+        &self,
+        domains: &Domains,
+        graph: &BipartiteGraph,
+        hall_vars: &[usize],
+        hall_vals: &[usize],
+    ) -> PropositionalConjunction {
+        // Mark which value indices are in V (the tight neighbourhood)
+        let in_hall_vals: Vec<bool> = {
+            let mut v = vec![false; graph.n_vals];
+            for &val_idx in hall_vals {
+                v[val_idx] = true;
+            }
+            v
+        };
+
+        // For each variable h in H, describe its confinement to V.
+        // Only emit literals that were true at propagation entry (pre-pruning
+        // domain snapshot), so no trail ordering violation occurs.
+        hall_vars
+            .iter()
+            .flat_map(|&h| {
+                let var = &self.sucs[h];
+                let lb = domains.lower_bound(var);
+                let ub = domains.upper_bound(var);
+
+                // If fixed, a single equality literal suffices
+                if let Some(fixed) = domains.fixed_value(var) {
+                    return vec![predicate!(var == fixed)];
+                }
+
+                let mut lits = vec![
+                    predicate!(var >= lb),
+                    predicate!(var <= ub),
+                ];
+
+                // Emit hole literals only for values OUTSIDE V that fall
+                // within [lb, ub] and are already absent from the domain.
+                // These holes explain why xh cannot escape V.
+                for d_idx in 0..graph.n_vals {
+                    if in_hall_vals[d_idx] {
+                        continue; // inside V, not a hole we need to explain
+                    }
+                    let d = d_idx as i32 + graph.val_offset;
+                    if d <= lb || d >= ub {
+                        continue; // already excluded by bounds
+                    }
+                    if !domains.contains(var, d) {
+                        lits.push(predicate!(var != d));
+                    }
+                }
+                lits
+            })
+            .collect()
+    }
+
 }
 
 // ============================
