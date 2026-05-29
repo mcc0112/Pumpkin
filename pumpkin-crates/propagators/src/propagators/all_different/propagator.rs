@@ -1,3 +1,11 @@
+/// A domain-consistent AllDifferent propagator based on bipartite matching. 
+/// 
+/// This propagator enforces generalized arc ocnsitncy (GAC) for the 
+/// AllDifferent constraint using the classical Regin algorithm
+/// 
+
+
+
 
 use pumpkin_core::declare_inference_label;
 use pumpkin_core::proof::ConstraintTag;
@@ -84,12 +92,14 @@ impl<Var: IntegerVariable + 'static> Propagator for AllDifferentPropagator<Var> 
     }
 }
 
-// ============================
-// STEP 1 - Build Bipartite Graph from domains
-// Creates an adjacency list where adj[i] is the list of value-indices
-// reachable from variable i.
-// ============================
-
+/// STEP 1 
+/// 
+/// Build the bipartite graph Var <-> Val used by Regin's filtering
+/// 
+/// Each variable node i connects to value nodes represenitng the integers
+/// currently in its domain. Values are normalized to a 0-indexed range using 
+/// val_offset to map bakc to actual domain values. 
+/// 
 struct BipartiteGraph {
     n_vars: usize,
     n_vals: usize,
@@ -139,9 +149,14 @@ impl BipartiteGraph {
     }
 }
 
-// ============================
-// STEP 2 - HOPCROFT-KARP MATCHING
-// ============================
+/// STEP 2 
+/// Compute a maximum matching between variables and values 
+/// 
+/// A perfect amtching corresponds to a feasible assignemt satisfying 
+/// AllDiffernet. If no perfect matching exists, the constraint is already violated 
+/// and we must extract a Hall set explaining the conflict
+/// 
+/// DFS phase is implemented iteratively to avoid recursion depth issues on large domains
 
 const UNMATCHED: usize = usize::MAX;
 const INF_DIST: usize = usize::MAX;
@@ -174,11 +189,10 @@ impl Matching {
 }
 
 fn hopcroft_karp(graph: &BipartiteGraph) -> Matching {
-    // OPTIMISATION 3: Matching no longer takes n_vals.
     let mut m = Matching::new(graph.n_vars, graph.n_vals);
 
     loop {
-        // ---- BFS phase: build layered graph of shortest augmenting paths ----
+        // BFS phase: build layered graph of shortest augmenting paths 
         let mut dist = vec![INF_DIST; graph.n_vars];
         let mut queue = std::collections::VecDeque::new();
 
@@ -206,7 +220,7 @@ fn hopcroft_karp(graph: &BipartiteGraph) -> Matching {
             break;
         }
 
-        // ---- DFS phase: augmentation ----
+        // DFS phase: augmentation 
         for i in 0..graph.n_vars {
             if m.match_var[i] == UNMATCHED && dfs_augment_iterative(i, graph, &mut m, &mut dist) {
                 m.size +=1;
@@ -216,8 +230,7 @@ fn hopcroft_karp(graph: &BipartiteGraph) -> Matching {
 
     m
 }
-//used iterative appraoche instead of recursive with explicit stack so that large isntances cannot 
-//overflow. Algotith - follow admissble edges in teh layered graph and augement the first free path
+
 fn dfs_augment_iterative (
     start: usize, 
     graph: &BipartiteGraph, 
@@ -275,10 +288,17 @@ fn dfs_augment_iterative (
     
 }
 
-// ============================
-// STEP 3 - FIND HALL SET
-// ============================
-
+/// Extracts a Hall set when the matching is not perfect 
+/// 
+/// A Hall set S is a set of variable whos combined domain valeus N(S)
+/// are too few -> Hall violation
+/// 
+/// The BFS explores alternating paths starting from unmatched variables. 
+/// All visited nodes form S and the visited value node form N(S)
+/// 
+/// The resulting explanation states taht the vairalbe in S are collectleively restiricted to N(S)
+/// which is insuffiecient -> thus conflict
+/// 
 fn find_hall_set(graph: &BipartiteGraph, m: &Matching) -> (Vec<usize>, Vec<usize>) {
     let mut var_visited = vec![false; graph.n_vars];
     let mut val_visited = vec![false; graph.n_vals];
@@ -321,6 +341,19 @@ fn find_hall_set(graph: &BipartiteGraph, m: &Matching) -> (Vec<usize>, Vec<usize
     (hall_vars, hall_vals)
 }
 
+
+/// For each varaible value pair (i, v) not in the maximum mathcing,
+/// determines whether assignemnd x_i = v would break all perfect amtching. 
+/// 
+/// This is done by 
+///     - Building the residual graph of alternating pathsi
+///     - COmputing SCCs 
+///     - Identifying tight Hall sets (SCCs where |H| = |V|)
+/// 
+/// if v belongs to such a tight Hall set but i doe not - then i cannot take v 
+/// without violating the Hall condition. The vlaue is pruned. 
+/// 
+/// Explanatiosn are constructed usign only infromation that awas tru tat the start of propagaiton, ensuring trail ordering
 fn find_pruning_hall_set(
     graph: &BipartiteGraph,
     m: &Matching,
@@ -378,9 +411,18 @@ fn find_pruning_hall_set(
     (hall_vars, hall_vals)
 }
 
-// ============================
-// STEP 4 - Residual Graph + Tarjan's SCC
-// ============================
+/// Build the directed residual graph used for SCC detection
+/// 
+/// Edges represnt alternating paths:
+///     - Unmatched edges; Var -> Val 
+///     - Matchign edge: Val -> Var 
+/// 
+/// Additioanlly, all free valeus connect to a special node T and 
+/// T connects back to all varaibles. This models the ability to start 
+/// an augmenting path from any free value. 
+/// 
+/// SCCs in this graph correspond to strongly connected alternating components
+/// Tight SCCs revela Hall sets taht justify pruning
 
 struct ResidualGraph {
     n_nodes: usize,  // n_vars + n_vals + 1 (the +1 is T)
@@ -391,7 +433,6 @@ impl ResidualGraph {
     fn build(graph: &BipartiteGraph, m: &Matching) -> Self {
         let n_vars = graph.n_vars;
         let n_vals = graph.n_vals;
-        // Add one extra node: T (the virtual "free values" node)
         let t_node = n_vars + n_vals;
         let n_nodes = n_vars + n_vals + 1;
 
@@ -400,7 +441,6 @@ impl ResidualGraph {
                 if i < n_vars {
                     Vec::with_capacity(graph.adj[i].len())
                 } else if i == t_node {
-                    // T → every variable: capacity n_vars
                     Vec::with_capacity(n_vars)
                 } else {
                     Vec::with_capacity(1)
@@ -408,36 +448,34 @@ impl ResidualGraph {
             })
             .collect();
 
-        // Build matched/unmatched residual edges (unchanged)
+        // Build matched/unmatched residual edges
         for i in 0..n_vars {
             for &v in &graph.adj[i] {
                 let var_node = i;
                 let val_node = n_vars + v;
                 if m.match_var[i] == v {
-                    // Matched edge reversed: value → variable
+                    // Matched edge reversed: value -> variable
                     adj[val_node].push(var_node);
                 } else {
-                    // Unmatched edge: variable → value
+                    // Unmatched edge: variable -> value
                     adj[var_node].push(val_node);
                 }
             }
         }
 
         // Connect free (unmatched) values through T
-        //   free_val_node → T       (any path reaching a free value can continue)
-        //   T → every variable      (T can re-enter the variable layer anywhere)
+        //   free_val_node -> T       (any path reaching a free value can continue)
+        //   T ->  every variable      (T can re-enter the variable layer anywhere)
         for v in 0..n_vals {
             if m.get_match_val(v) == UNMATCHED {
                 let val_node = n_vars + v;
-                adj[val_node].push(t_node);   // free value → T
+                adj[val_node].push(t_node);   
             }
         }
-        // Only add T→var edges if T actually has incoming edges (i.e. there are free values).
-        // This avoids polluting the SCC analysis when all values are matched.
-        let has_free_vals = (0..n_vals).any(|v| m.get_match_val(v) == UNMATCHED);
+        let has_free_vals = (0..n_vals).any(|v: usize| m.get_match_val(v) == UNMATCHED);
         if has_free_vals {
             for i in 0..n_vars {
-                adj[t_node].push(i);          // T → variable i
+                adj[t_node].push(i);          
             }
         }
 
@@ -446,13 +484,15 @@ impl ResidualGraph {
 }
 
 
-// ============================
-// STEP 5 - Tarjan's SCC
-// ============================
-
-// OPTIMISATION 4: replace Vec<Option<usize>> (2 words per slot) with a plain
-// Vec<usize> using usize::MAX as the "unvisited" sentinel, halving the memory
-// cost of the indices array.
+/// Tarjan's SCC
+/// 
+/// Computes strongly connected components of the residual grpah
+/// 
+/// The SCC strcuture paritioans variable sand values into components that
+/// share alteranting reachability. A component where teh number of variable 
+/// nodes equals teh number of value ndoe corresponds to a tight Hall st
+/// 
+/// The implementaiton is once again iterative
 const UNVISITED: usize = usize::MAX;
 
 struct TarjanState {
@@ -491,7 +531,6 @@ fn tarjan_scc(graph: &ResidualGraph) -> Vec<usize> {
 }
 
 fn tarjan_visit(start: usize, adj: &[Vec<usize>], state: &mut TarjanState) {
-    // OPTIMISATION 4: use sentinel comparisons in place of Option methods.
     state.indices[start]  = state.index;
     state.lowlinks[start] = state.index;
     state.index += 1;
@@ -548,15 +587,26 @@ fn tarjan_visit(start: usize, adj: &[Vec<usize>], state: &mut TarjanState) {
     }
 }
 
-// ============================
-// Core propagation logic
-// ============================
+/// Main propagation entry point.
+///
+/// 1. Build bipartite graph from current domains.
+/// 2. Compute maximum matching.
+/// 3. If matching is not perfect → extract Hall set → raise conflict.
+/// 4. Otherwise:
+///      a. Build residual graph.
+///      b. Compute SCCs.
+///      c. For each variable–value pair not in the matching:
+///           - If they lie in different SCCs → prune value.
+///           - Generate minimal explanation using Hall structure.
+/// 5. Apply all prunings.
+///
+/// This ensures full domain consistency for `AllDifferent`.
 
 impl<Var: IntegerVariable + 'static> AllDifferentPropagator<Var> {
     fn check_conflict_and_propgate(&self, mut context: PropagationContext) -> PropagationStatusCP {
         let domains = context.domains();
 
-        //early resturn - just in case
+        //Check
         if self.sucs.is_empty() {
             return Ok(());
         }
@@ -587,10 +637,8 @@ impl<Var: IntegerVariable + 'static> AllDifferentPropagator<Var> {
         let scc_id = tarjan_scc(&residual);
 
         // Step 6: pruning — collect then apply
-        // OPTIMISATION: pre-size with a lower-bound capacity to avoid repeated growth.
         let mut prunings: Vec<(usize, i32, PropositionalConjunction)> =
             Vec::with_capacity(graph.n_vars);
-        // In check_conflict_and_propgate, pruning loop:
         for i in 0..graph.n_vars {
             let matched_val = matching.match_var[i];
             for &v in &graph.adj[i] {
@@ -670,83 +718,60 @@ impl<Var: IntegerVariable + 'static> AllDifferentPropagator<Var> {
             })
             .collect()
     }
+    
     /// Build a minimal explanation for the pruning of value `pruned_val_idx`
     /// from variable `var_idx`.
-    ///
-    /// Following Downing, Feydy & Stuckey (2012), equation (1):
-    ///
-    ///   ∧_{h ∈ H, d ∈ E \ V}  [x_h ≠ d]  →  [x_i ≠ j]
-    ///
-    /// where H and V are extracted from the SCC of `val_node` in the residual
-    /// graph:
-    ///   H = { variable nodes in scc(val_node) }
-    ///   V = { value nodes    in scc(val_node) }  (stripping the n_vars offset)
-    ///
-    /// Intuitively: the SCC reveals a tight Hall set — the variables in H are
-    /// collectively confined to the values in V (|H| = |V| in a saturated
-    /// matching). The pruned value j lies in V, so x_i (which is *not* in H)
-    /// cannot use j.
-    ///
-    /// As in make_hall_explanation, V = N(H) by the Hall set property, so
-    /// every [x_h ≠ d] for d ∈ E\V is already a fact in the current domain.
-    fn make_pruning_explanation(
-        &self,
-        domains: &Domains,
-        graph: &BipartiteGraph,
-        scc_id: &[usize],
-        val_node: usize,
-    ) -> PropositionalConjunction {
-        let target_scc = scc_id[val_node];
-        let n_vars = graph.n_vars;
+    // fn make_pruning_explanation(
+    //     &self,
+    //     domains: &Domains,
+    //     graph: &BipartiteGraph,
+    //     scc_id: &[usize],
+    //     val_node: usize,
+    // ) -> PropositionalConjunction {
+    //     let target_scc = scc_id[val_node];
+    //     let n_vars = graph.n_vars;
 
-        // Collect which value indices are in the target SCC
-        let in_val_scc: Vec<bool> = {
-            let mut v = vec![false; graph.n_vals];
-            for val_idx in 0..graph.n_vals {
-                let node = n_vars + val_idx;
-                if scc_id[node] == target_scc {
-                    v[val_idx] = true;
-                }
-            }
-            v
-        };
+    //     // Collect which value indices are in the target SCC
+    //     let in_val_scc: Vec<bool> = {
+    //         let mut v = vec![false; graph.n_vals];
+    //         for val_idx in 0..graph.n_vals {
+    //             let node = n_vars + val_idx;
+    //             if scc_id[node] == target_scc {
+    //                 v[val_idx] = true;
+    //             }
+    //         }
+    //         v
+    //     };
 
-        // For each variable h in the tight SCC, describe its confinement
-        // using only bounds and holes that existed at propagation entry.
-        // Critically: only emit [xh != d] for values d that were already
-        // absent from D(xh) when propagation started — never for values
-        // removed during this propagation call.
-        (0..n_vars)
-            .filter(|&h| scc_id[h] == target_scc)
-            .flat_map(|h| {
-                let var = &self.sucs[h];
-                let lb = domains.lower_bound(var);
-                let ub = domains.upper_bound(var);
+    //     // For each variable h in the tight SCC, describe its confinement
+    //     // using only bounds and holes that existed at propagation entry.
+    //     (0..n_vars)
+    //         .filter(|&h| scc_id[h] == target_scc)
+    //         .flat_map(|h| {
+    //             let var = &self.sucs[h];
+    //             let lb = domains.lower_bound(var);
+    //             let ub = domains.upper_bound(var);
 
-                let mut lits = vec![
-                    predicate!(var >= lb),
-                    predicate!(var <= ub),
-                ];
-
-                // Only emit hole literals for values inside the SCC range
-                // that are genuinely absent — these were absent at entry
-                // since we read from the pre-pruning domain snapshot.
-                for val_idx in 0..graph.n_vals {
-                    if in_val_scc[val_idx] {
-                        continue; // value is in the tight set, skip
-                    }
-                    let d = val_idx as i32 + graph.val_offset;
-                    if d <= lb || d >= ub {
-                        continue; // already excluded by bounds
-                    }
-                    if !domains.contains(var, d) {
-                        lits.push(predicate!(var != d));
-                    }
-                }
-                lits
-            })
-            .collect()
-    }
+    //             let mut lits = vec![
+    //                 predicate!(var >= lb),
+    //                 predicate!(var <= ub),
+    //             ];
+    //             for val_idx in 0..graph.n_vals {
+    //                 if in_val_scc[val_idx] {
+    //                     continue; // value is in the tight set, skip
+    //                 }
+    //                 let d = val_idx as i32 + graph.val_offset;
+    //                 if d <= lb || d >= ub {
+    //                     continue; // already excluded by bounds
+    //                 }
+    //                 if !domains.contains(var, d) {
+    //                     lits.push(predicate!(var != d));
+    //                 }
+    //             }
+    //             lits
+    //         })
+    //         .collect()
+    // }
 
     fn make_pruning_explanation_from_hall(
         &self,
@@ -765,8 +790,7 @@ impl<Var: IntegerVariable + 'static> AllDifferentPropagator<Var> {
         };
 
         // For each variable h in H, describe its confinement to V.
-        // Only emit literals that were true at propagation entry (pre-pruning
-        // domain snapshot), so no trail ordering violation occurs.
+
         hall_vars
             .iter()
             .flat_map(|&h| {
@@ -993,9 +1017,7 @@ mod tests {
         );
     }
 
-    // ── Test 2 ──────────────────────────────────────────────────────────────────
-    // Both x and y have domain {1,2}. Both values appear in some maximum matching,
-    // so neither should be pruned from either variable.
+
     #[test]
     fn alldiff_prune_symmetric_pair_no_pruning() {
         let (mut state, vars) = make_state_get_vars(&[(1, 2), (1, 2)]);
@@ -1014,9 +1036,6 @@ mod tests {
         }
     }
 
-    // ── Test 3 ──────────────────────────────────────────────────────────────────
-    // Staircase domains. Every edge lies on some augmenting path, so no pruning
-    // should occur — this checks the propagator does not over-prune.
     #[test]
     fn alldiff_prune_staircase_no_over_pruning() {
         let (mut state, vars) = make_state_get_vars(&[(1, 2), (2, 3), (3, 4)]);
@@ -1033,9 +1052,6 @@ mod tests {
         );
     }
 
-    // ── Test 4 ──────────────────────────────────────────────────────────────────
-    // x and y together form a Hall set over {1,2}. z must take 3 — so 1 and 2
-    // must be pruned from z's domain. This is the core SCC pruning case.
     #[test]
     fn alldiff_prune_hall_pair_forces_third_var() {
         let (mut state, vars) = make_state_get_vars(&[(1, 2), (1, 2), (1, 3)]);
@@ -1056,9 +1072,7 @@ mod tests {
         );
     }
 
-    // ── Test 5 ──────────────────────────────────────────────────────────────────
-    // z has a wide domain including value 4, which only z can take.
-    // Because 4 is exclusively z's, it lies in z's SCC and must NOT be pruned.
+
     #[test]
     fn alldiff_prune_exclusive_value_in_wide_domain_preserved() {
         let (mut state, vars) = make_state_get_vars(&[(1, 2), (2, 3), (1, 4)]);
@@ -1075,9 +1089,7 @@ mod tests {
         );
     }
 
-    // ── Test 6 ──────────────────────────────────────────────────────────────────
-    // x is fixed to 3. y has domain {1,3}. Value 3 is consumed by x, so it must
-    // be pruned from y. Value 1 must survive.
+
     #[test]
     fn alldiff_prune_fixed_var_removes_its_value_from_peer_domain() {
         let (mut state, vars) = make_state_get_vars(&[(3, 3), (1, 3), (1, 2)]);
@@ -1093,12 +1105,6 @@ mod tests {
             "value 1 is not taken by any fixed var and must remain in y"
         );
     }
-
-    // ── Test 7 ──────────────────────────────────────────────────────────────────
-    // Three vars, three vals, full domains. Every (var, val) pair lies on some
-    // maximum matching, so every value belongs to the same SCC as its variable.
-    // Nothing should be pruned — directly analogous to the circuit test that
-    // checks the "closing edge" is not wrongly pruned.
     #[test]
     fn alldiff_prune_full_latin_square_no_pruning() {
         let (mut state, vars) = make_state_get_vars(&[(1, 3), (1, 3), (1, 3)]);
@@ -1115,11 +1121,6 @@ mod tests {
         }
     }
 
-    // ── Test 8 ──────────────────────────────────────────────────────────────────
-    // The direct AllDifferent analogue of the circuit "closing Hamiltonian edge"
-    // test: x=1 and y=2 are fixed, z∈{1,2,3}. Values 1 and 2 are consumed;
-    // value 3 is the only one that completes the assignment — it must NOT be
-    // pruned. Values 1 and 2 in z MUST be pruned.
     #[test]
     fn alldiff_prune_only_completing_value_preserved() {
         let (mut state, vars) = make_state_get_vars(&[(1, 1), (2, 2), (1, 3)]);

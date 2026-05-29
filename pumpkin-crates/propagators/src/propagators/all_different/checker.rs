@@ -1,3 +1,17 @@
+/// A verfication checker for the AllDifferent Propagator
+/// 
+/// This checker re-computes the Hall-set reasonign used by the propagatir, 
+/// TODO CHANGE TO ONLY INCLUDE CHECKING FOR HALL SETS
+/// 
+/// The check currently validates the following:
+///     - Conflict - (no consequent) = hall violation - no perfect matching
+///     - Pruning (some consequent)
+///         The premises describe a tight hall set of T_vars confined to T_vals 
+/// 
+/// THerefor, the checker currently rebuilds ab ipartite graph form teh induced domains
+/// optionally pins a varaible to a singleton (prunig)
+/// and runs Hopcroft-karp tot test whethe  a perfect matching exists
+
 use pumpkin_checking::AtomicConstraint;
 use pumpkin_checking::CheckerVariable;
 use pumpkin_checking::InferenceChecker;
@@ -8,37 +22,20 @@ pub struct AllDifferentChecker<Var> {
     pub successors: Box<[Var]>,
 }
 
-/// Core verification logic for AllDifferent.
+/// Main entry point for verifying an inference.
 ///
-/// The checker is called with:
-///   - `state`:      the domain state induced by the *premises* (the explanation).
-///   - `premises`:   the literals that form the explanation.
-///   - `consequent`: None  → verifying a conflict;
-///                   Some(a) → verifying the pruning `xi ≠ v`.
 ///
-/// ## Conflict verification  (consequent = None)
+/// The logic splits into two cases:
 ///
-/// The premises describe a set S of variables confined to a neighbourhood N(S).
-/// We must confirm |max_matching(S, N(S))| < |S|, i.e. Hall's condition is
-/// violated. The `state` already encodes each variable's domain as induced by
-/// the premises, so we just run Hopcroft-Karp and check the matching size.
+///   - Conflict verification
+///       premises  -> conflict  _> We simply check that the induced domains admit no perfect matching
 ///
-/// ## Pruning verification  (consequent = Some(xi ≠ v))
+///   - Pruning verification
+///       premises ∧ (xi = v)  →  conflict  
+///     We pin xi to {v}, rebuild the bipartite graph, and check that the
+///     matching becomes impossible.
 ///
-/// The explanation is a tight Hall set T_vars whose neighbourhood T_vals
-/// satisfies |T_vals| = |T_vars| (a saturated matching).  We need to prove
-/// that under the premises, xi *cannot* take v.
-///
-/// The standard LCG verification rule is:
-///   premises  ∧  ¬(consequent)  →  conflict
-///
-/// ¬(xi ≠ v)  is  xi = v.  So we add xi = v on top of the premise-induced
-/// state and check whether a Hall violation (no perfect matching) follows.
-/// If matching size < n_vars, the inference is valid.
-///
-/// Concretely: the premises pin T_vars to T_vals; adding xi = v means xi
-/// competes for a value already fully consumed by T_vars, causing the
-/// violation.
+/// return true is inference is valid
 impl<Var, Atomic> InferenceChecker<Atomic> for AllDifferentChecker<Var>
 where
     Var: CheckerVariable<Atomic>,
@@ -51,7 +48,7 @@ where
         consequent: Option<&Atomic>,
     ) -> bool {
         match consequent {
-            // ── Conflict case ────────────────────────────────────────────────
+            // Conflict case
             None => {
                 // Under the premise-induced domain, confirm Hall violation.
                 let (n_vars, n_vals, adj) =
@@ -59,17 +56,14 @@ where
                 hopcroft_karp_size(n_vars, n_vals, &adj) < n_vars
             }
 
-            // ── Pruning case: verify  premises ∧ (xi = v)  →  conflict ──────
+            //Pruning case
             Some(consequent_atom) => {
-                // Find which variable xi the consequent constrains.
                 let pinned_var_idx = self
                     .successors
                     .iter()
                     .position(|var| var.does_atomic_constrain_self(consequent_atom));
 
-                // The value that the consequent claims to remove.
-                // For a `xi ≠ v` consequent, its negation is `xi = v`.
-                // We pin xi to v and check for a Hall violation.
+
                 let pruned_val = consequent_atom.value();
 
                 let (n_vars, n_vals, adj) = build_bipartite::<Var, Atomic>(
@@ -86,15 +80,17 @@ where
     }
 }
 
-/// Build a bipartite variable/value adjacency list from the premise-induced
-/// domain state, with an optional pin that forces one variable to a single value.
-///
-/// The pin implements  ¬(consequent):
-///   - For pruning `xi ≠ v`, the negation is `xi = v`, so we pin variable xi
-///     to the singleton domain {v}.
-///
-/// For all other variables, `iter_induced_domain` returns the domain as
-/// narrowed by the premises.
+/// Construct bipartite graph used for verification
+/// 
+/// If pruning chekc is being performed one var is pinned to 
+/// a sigleton domain
+/// 
+/// Then the function:
+///     collects all value appearing in any domain
+///     compresses them into a dense 0-indexed range, 
+///     buildds adjacney list for Hopcroft-karp
+/// 
+/// The resulign graph exctly reflec the domain state that the explantaiotn claims to jsutify
 fn build_bipartite<Var, Atomic>(
     successors: &[Var],
     state: &VariableState<Atomic>,
@@ -106,7 +102,7 @@ where
 {
     let n_vars = successors.len();
 
-    // Collect each variable's domain under the premise state, applying
+    // Collect each variable's domain under the premise state+ applies
     // the pin to the target variable.
     let domains: Vec<Vec<i32>> = successors
         .iter()
@@ -114,11 +110,9 @@ where
         .map(|(i, var)| {
             if let Some((pin_idx, pin_val)) = pin {
                 if i == pin_idx {
-                    // Negated consequent: restrict xi to exactly {pin_val}.
                     return vec![pin_val];
                 }
             }
-            // All other variables: use domain induced by premises.
             var.iter_induced_domain(state)
                 .into_iter()
                 .flatten()
@@ -126,7 +120,6 @@ where
         })
         .collect();
 
-    // Build a compact value index (only values that actually appear).
     let mut all_vals: Vec<i32> = domains.iter().flatten().copied().collect();
     all_vals.sort_unstable();
     all_vals.dedup();
@@ -141,10 +134,12 @@ where
     (n_vars, n_vals, adj)
 }
 
-// ---------------------------------------------------------------------------
-// Hopcroft-Karp — returns only the matching size.
-// ---------------------------------------------------------------------------
-
+/// Computes only the size of a maximum matching
+/// 
+/// A perfect matching exists iff size == n_vars
+/// 
+/// The implementaion is a standard Hopcroft-Karp BFS/DFS layering algorithm
+/// Only the mathcin gsize is needed so the strucutre is simplified. 
 const UNMATCHED: usize = usize::MAX;
 const INF_DIST: usize = usize::MAX;
 
@@ -194,6 +189,13 @@ fn hopcroft_karp_size(n_vars: usize, n_vals: usize, adj: &[Vec<usize>]) -> usize
     size
 }
 
+/// DFS search for augmenting paths in the layered graph
+///
+/// This follows the classical Hopcroft–Karp DFS phase:
+///   - Only edges consistent with BFS distances are explored
+///   - If an augmenting path is found, the matching is updated in place
+///
+/// Returning true means the matching was increased by on
 fn dfs_augment(
     i: usize,
     adj: &[Vec<usize>],
@@ -285,9 +287,7 @@ mod tests {
         assert!(checker.check(state, &premises, None));
     }
 
-    // =========================================================
-    // NO-CONFLICT CASES  (consequent = None, should return false)
-    // =========================================================
+
 
     #[test]
     fn no_conflict_all_distinct_fixed() {
@@ -307,20 +307,7 @@ mod tests {
         assert!(!checker.check(state, &premises, None));
     }
 
-    // =========================================================
-    // PRUNING CASES  (consequent = Some(xi ≠ v), should return true)
-    //
-    // The premises describe a tight Hall set T_vars ⊆ {vars} \ {xi} whose
-    // neighbourhood T_vals is exactly |T_vars| values.  The consequent says
-    // xi ≠ v for some v ∈ T_vals.
-    //
-    // Verification: premises ∧ (xi = v) → Hall violation → return true.
-    // =========================================================
 
-    /// x0 ∈ {1,2}, x1 = 1 (fixed).
-    /// Tight set = {x1}, T_vals = {1}.
-    /// Pruning: x0 ≠ 1.
-    /// Check: premises = [x1 = 1], pin x0 = 1 → both compete for 1 → conflict.
     #[test]
     fn pruning_fixed_var_removes_value_from_peer() {
         // Premises: x1 is fixed to 1 (describes the tight set {x1}).
@@ -336,10 +323,6 @@ mod tests {
         );
     }
 
-    /// x0, x1 ∈ {1,2} — tight pair forming Hall set over {1,2}.
-    /// Pruning: x2 ≠ 1  (and separately x2 ≠ 2).
-    /// Premises: x0 ∈ {1,2} (lb/ub), x1 ∈ {1,2} (lb/ub) — domain confined.
-    /// Check: pin x2 = 1 → x0, x1, x2 all fight for {1,2} → only 2 values for 3 vars.
     #[test]
     fn pruning_hall_pair_forces_third_var_away_from_1() {
         // Describe the tight pair {x0, x1} confined to {1, 2}.
@@ -367,8 +350,6 @@ mod tests {
         );
     }
 
-    /// x0=1, x1=2 fixed.  Tight set = {x0, x1}, T_vals = {1, 2}.
-    /// Pruning: x2 ≠ 1 and x2 ≠ 2.
     #[test]
     fn pruning_two_fixed_vars_force_third_away() {
         // Two fixed variables form the tight set.
@@ -391,12 +372,7 @@ mod tests {
         );
     }
 
-    // =========================================================
-    // INVALID PRUNING CASES  (should return false — the inference
-    // is NOT justified by the given premises)
-    // =========================================================
 
-    /// x0 ∈ {1,2} and x1 ∈ {1,2} don't justify pruning value 3 from x2.
     #[test]
     fn invalid_pruning_value_not_in_tight_set() {
         let premises = [ge("x0", 1), le("x0", 2), ge("x1", 1), le("x1", 2)];
@@ -411,7 +387,6 @@ mod tests {
         );
     }
 
-    /// Single fixed variable x0=1 does NOT justify removing 2 from x1.
     #[test]
     fn invalid_pruning_different_value() {
         let premises = [eq("x0", 1)];
