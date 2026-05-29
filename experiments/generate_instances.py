@@ -1,57 +1,59 @@
 """
-Instance generator for circuit-constraint benchmark problems,
-following the method described in:
+generate_instances.py  –  Circuit-constraint feasibility benchmark instances
+=============================================================================
 
-  Francis & Stuckey (2014) "Explaining circuit propagation",
-  Constraints 19:1-29, Section 3.
+Generates geographic k-nearest Hamiltonian circuit feasibility instances
+following the method of Francis & Stuckey (2014) "Explaining circuit
+propagation", Constraints 19:1-29, Section 3.
 
-Generation procedure:
+Generation procedure
+--------------------
   1. Place n locations uniformly at random in the unit square.
   2. Compute pairwise Euclidean distances (scaled to integers).
-  3. Connect each node to its k nearest neighbours (directed graph;
-     edges are added in both directions so the graph is symmetric).
-  4. Perform a random walk to guarantee at least one Hamiltonian
-     circuit exists: whenever every edge leaving the current node
-     leads to an already-visited node, add a fresh random edge to
-     an unvisited node; finally close the walk with an edge back to
-     the start.
-  5. Write a MiniZinc (.mzn) file asking only for FEASIBILITY:
-     find any Hamiltonian circuit using only edges present in the
-     transport network.  No objective is used, so solver effort
-     reflects propagation behaviour directly.
+  3. Connect each node to its k nearest geographic neighbours (symmetric).
+  4. Perform a random walk to guarantee at least one Hamiltonian circuit:
+     whenever the walk gets stuck, add a fresh edge to an unvisited node;
+     close the walk back to the start.  Walk-added edges are tracked
+     separately so callers can detect near-degenerate instances.
+  5. Write a MiniZinc (.mzn) file asking only for FEASIBILITY: find any
+     Hamiltonian circuit using edges present in the network.
 
      Rationale for feasibility over min-cost TSP
      --------------------------------------------
-     This benchmark suite is designed to study AllDifferent propagator
-     behaviour inside the Circuit constraint in an LCG solver.  Adding
-     a minimisation objective (e.g. minimise total tour length) causes
-     the solver to continue searching after the first solution to prove
-     optimality.  The extra search is driven by cost-bound propagation,
-     not by AllDifferent or Circuit, making it impossible to cleanly
-     attribute differences in node counts / failures / explanation size
-     to the propagator under study.  Pure feasibility stops at the first
-     solution, so every measured quantity directly reflects how well
-     AllDifferent prunes the Circuit search space.
+     A minimisation objective causes the solver to continue after the first
+     solution to prove optimality, and that extra search is driven by
+     cost-bound propagation rather than AllDifferent / Circuit.  Pure
+     feasibility stops at the first solution, so every measured metric
+     directly reflects propagation behaviour.
+
+Walk-edge fraction diagnostic
+------------------------------
+The MZN header reports:
+  - total undirected edges in the network
+  - edges added by the k-nearest step
+  - edges added by the random walk (= total - k-nearest)
+A high walk fraction indicates that the k-nearest graph was too sparse to
+sustain a Hamiltonian circuit on its own, which can make the instance
+structurally degenerate.  Callers should flag instances where
+walk_edges / total_edges exceeds a chosen threshold (e.g. 0.20).
 
 Usage
 -----
-python generate_instances.py [options]
+    python generate_instances.py [options]
 
 Options
 -------
-  -n, --nodes        INT    Number of locations (default: 50)
-  -k, --neighbours   INT    Number of nearest neighbours per node (default: 7)
-  -c, --count        INT    Number of instances to generate (default: 1)
-  -s, --seed         INT    Random seed for reproducibility (default: random)
-  -o, --outdir       PATH   Output directory (default: current directory)
-  --scale            INT    Multiplier to convert float distances to integers
-                            (default: 1000, giving millimetre precision for a
-                            unit-square layout)
-  --prefix           STR    Filename prefix (default: "instance")
+  -n, --nodes        INT    Number of locations         (default: 50)
+  -k, --neighbours   INT    k-nearest degree            (default: 7)
+  -c, --count        INT    Instances to generate       (default: 1)
+  -s, --seed         INT    Base random seed            (default: random)
+  -o, --outdir       PATH   Output directory            (default: .)
+  --scale            INT    Distance scale factor       (default: 1000)
+  --prefix           STR    Filename prefix             (default: instance)
 
 Output
 ------
-One .mzn file per instance, named  <prefix>_n<N>_k<K>_<index>.mzn
+One .mzn file per instance named  <prefix>_n<N>_k<K>_<index>.mzn
 """
 
 import argparse
@@ -94,9 +96,8 @@ def k_nearest_edges(
     k: int,
 ) -> Set[Tuple[int, int]]:
     """
-    Return the set of undirected edges {(i,j) | j is among the k nearest
-    neighbours of i}.  Edges are stored as (min, max) pairs to avoid
-    duplicates.
+    Return undirected edges {(i,j)} where j is among the k nearest
+    neighbours of i.  Stored as (min, max) pairs to avoid duplicates.
     """
     n = len(dist)
     edges: Set[Tuple[int, int]] = set()
@@ -116,11 +117,11 @@ def random_walk_hamiltonian(
     rng: random.Random,
 ) -> List[Tuple[int, int]]:
     """
-    Perform a random walk on the current adjacency structure to produce
-    a Hamiltonian circuit, adding new edges whenever the walk gets stuck.
+    Perform a random walk to produce a Hamiltonian circuit, adding new
+    edges whenever the walk gets stuck.
 
-    Returns the list of extra (undirected) edges that were added so the
-    caller can insert them into the edge set.
+    Returns the list of (undirected) edges that were added during the walk
+    so the caller can compute the walk-edge fraction.
     """
     start = rng.randrange(n)
     visited = [False] * n
@@ -145,7 +146,7 @@ def random_walk_hamiltonian(
         path.append(nxt)
         current = nxt
 
-    # Close the circuit
+    # Close the circuit back to start
     if start not in adj[current]:
         adj[current].add(start)
         adj[start].add(current)
@@ -159,40 +160,36 @@ def build_graph(
     k: int,
     dist: List[List[int]],
     rng: random.Random,
-) -> List[List[int]]:
+) -> Tuple[List[Set[int]], int, int]:
     """
     Build the transport network following Francis & Stuckey Section 3.
 
-    Returns allowed[i][j]:
-      False  if no direct connection exists between i and j
-      True   if an edge exists (i.e. j is a valid successor of i)
-
-    Note: distances are no longer written to the MZN file because the
-    feasibility model has no cost objective.  We retain the distance
-    matrix only for k-nearest construction; the output is a plain
-    boolean adjacency structure.
+    Returns
+    -------
+    adj              : adjacency sets (adj[i] = set of successor indices, 0-based)
+    knn_edge_count   : number of undirected edges from the k-nearest step
+    walk_edge_count  : number of undirected edges added by the random walk
     """
-    edge_set = k_nearest_edges(dist, k)
+    knn_edges = k_nearest_edges(dist, k)
+    knn_edge_count = len(knn_edges)
 
     adj: List[Set[int]] = [set() for _ in range(n)]
-    for (i, j) in edge_set:
+    for (i, j) in knn_edges:
         adj[i].add(j)
         adj[j].add(i)
 
-    extra = random_walk_hamiltonian(n, adj, rng)
-    edge_set.update(extra)
+    walk_added = random_walk_hamiltonian(n, adj, rng)
 
-    # Boolean adjacency matrix
-    allowed = [[False] * n for _ in range(n)]
-    for (i, j) in edge_set:
-        allowed[i][j] = True
-        allowed[j][i] = True
+    # Count only genuinely new walk edges
+    all_edges = set(knn_edges)
+    new_walk_edges = [e for e in walk_added if e not in all_edges]
+    walk_edge_count = len(new_walk_edges)
 
-    return allowed, edge_set
+    return adj, knn_edge_count, walk_edge_count
 
 
 # ---------------------------------------------------------------------------
-# MiniZinc file writer  –  FEASIBILITY model
+# MiniZinc writer – feasibility model
 # ---------------------------------------------------------------------------
 
 MZN_TEMPLATE = """\
@@ -202,52 +199,58 @@ MZN_TEMPLATE = """\
 %%
 %% Model: pure feasibility -- find any Hamiltonian circuit that uses
 %%        only edges present in the transport network.
-%%        No objective is included so that solver effort (node count,
-%%        failures, explanation size) reflects propagation behaviour
-%%        directly, without interference from cost-bound reasoning.
+%%        No objective is included so solver effort (failures, nodes,
+%%        explanation size) directly reflects propagation behaviour.
 %%
-%% Parameters
-%%   n    = {n}  (number of locations)
-%%   k    = {k}  (nearest-neighbour degree used during generation)
-%%   seed = {seed}
-%%   edges = {num_edges}  (undirected edges in the transport network)
+%% Instance parameters
+%%   n              = {n}
+%%   k              = {k}
+%%   seed           = {seed}
+%%   knn_edges      = {knn_edges}   (undirected edges from k-nearest step)
+%%   walk_edges     = {walk_edges}  (undirected edges added by random walk)
+%%   total_edges    = {total_edges}
+%%   walk_fraction  = {walk_fraction:.4f}  (walk_edges / total_edges)
+%%
+%% NOTE: a walk_fraction above 0.20 may indicate a near-degenerate instance
+%%       in which the random walk dominates the graph structure.
 
-include "circuit.mzn";
+include "globals.mzn";
 
 int: n = {n};
-set of int: Locations = 1..n;
 
-%% allowed[i,j] = true iff a direct link exists from i to j
-array[Locations, Locations] of bool: allowed = array2d(Locations, Locations, [
-{allowed_rows}
-]);
+%% allowed[i] = set of valid successors for node i (1-indexed)
+array[1..n] of set of int: allowed = [{allowed_sets}
+];
 
-%% Successor variables: succ[i] = next location after i in the tour
-array[Locations] of var Locations: succ;
+%% Successor variables: x[i] = next location after i in the tour
+array[1..n] of var 1..n: x;
 
 %% Restrict successors to existing edges only
-constraint forall(i in Locations)(
-  succ[i] in {{j | j in Locations where allowed[i, j]}}
+constraint forall(i in 1..n)(
+  x[i] in allowed[i]
 );
 
 %% Successors must form a Hamiltonian circuit
-constraint circuit(succ);
+constraint pumpkin_circuit(x);
 
-solve satisfy;
+solve :: int_search(x, input_order, indomain_min, complete) satisfy;
 
 output [
-  "succ = ", show(succ), "\\n"
+  "x = ", show(x), "\\n"
 ];
+
 """
 
 
-def format_allowed(allowed: List[List[bool]], n: int) -> str:
-    """Format the 2-D boolean adjacency matrix as a flat MiniZinc literal."""
+def format_allowed_sets(adj: List[Set[int]], n: int) -> str:
+    """Format adjacency sets as MiniZinc set literals (1-indexed)."""
     lines = []
     for i in range(n):
-        row = ", ".join("true" if allowed[i][j] else "false" for j in range(n))
+        # Convert to 1-indexed and sort for readability
+        successors = sorted(j + 1 for j in adj[i])
+        set_str = "{" + ", ".join(str(j) for j in successors) + "}"
         comma = "," if i < n - 1 else ""
-        lines.append(f"  {row}{comma}  %% from location {i + 1}")
+        lines.append(f"  {set_str}{comma}  %% node {i + 1}")
     return "\n".join(lines)
 
 
@@ -256,21 +259,52 @@ def write_mzn(
     n: int,
     k: int,
     seed: int,
-    allowed: List[List[bool]],
-    num_edges: int,
+    adj: List[Set[int]],
+    knn_edges: int,
+    walk_edges: int,
 ) -> None:
-    allowed_rows = format_allowed(allowed, n)
+    total_edges = knn_edges + walk_edges
+    walk_fraction = walk_edges / total_edges if total_edges > 0 else 0.0
 
     content = MZN_TEMPLATE.format(
         n=n,
         k=k,
         seed=seed,
-        num_edges=num_edges,
-        allowed_rows=allowed_rows,
+        knn_edges=knn_edges,
+        walk_edges=walk_edges,
+        total_edges=total_edges,
+        walk_fraction=walk_fraction,
+        allowed_sets=format_allowed_sets(adj, n),
     )
 
     with open(filepath, "w") as fh:
         fh.write(content)
+
+
+# ---------------------------------------------------------------------------
+# Core generation function
+# ---------------------------------------------------------------------------
+
+def generate_instance(
+    n: int,
+    k: int,
+    seed: int,
+    scale: int,
+) -> Tuple[List[Set[int]], int, int]:
+    """
+    Generate one instance.
+
+    Returns
+    -------
+    adj              : adjacency sets (0-based indices)
+    knn_edge_count   : edges from k-nearest step
+    walk_edge_count  : edges added by random walk
+    """
+    rng = random.Random(seed)
+    coords = [(rng.random(), rng.random()) for _ in range(n)]
+    dist = build_distance_matrix(coords, scale)
+    adj, knn_edge_count, walk_edge_count = build_graph(n, k, dist, rng)
+    return adj, knn_edge_count, walk_edge_count
 
 
 # ---------------------------------------------------------------------------
@@ -281,46 +315,22 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Generate circuit-constraint feasibility benchmark instances "
-            "(Francis & Stuckey 2014 method) and write MiniZinc files."
+            "(Francis & Stuckey 2014) and write MiniZinc files."
         ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("-n", "--nodes", type=int, default=50,
-                        help="Number of locations")
-    parser.add_argument("-k", "--neighbours", type=int, default=7,
-                        help="Number of nearest neighbours per node")
-    parser.add_argument("-c", "--count", type=int, default=1,
-                        help="Number of instances to generate")
-    parser.add_argument("-s", "--seed", type=int, default=None,
-                        help="Base random seed (uses system entropy if omitted)")
-    parser.add_argument("-o", "--outdir", type=str, default=".",
-                        help="Output directory for .mzn files")
-    parser.add_argument("--scale", type=int, default=1000,
-                        help="Scale factor: distances = round(Euclidean * scale)")
-    parser.add_argument("--prefix", type=str, default="instance",
-                        help="Filename prefix")
+    parser.add_argument("-n", "--nodes",      type=int, default=50)
+    parser.add_argument("-k", "--neighbours", type=int, default=7)
+    parser.add_argument("-c", "--count",      type=int, default=1)
+    parser.add_argument("-s", "--seed",       type=int, default=None)
+    parser.add_argument("-o", "--outdir",     type=str, default=".")
+    parser.add_argument("--scale",            type=int, default=1000)
+    parser.add_argument("--prefix",           type=str, default="instance")
     return parser.parse_args()
-
-
-def generate_instance(
-    n: int,
-    k: int,
-    seed: int,
-    scale: int,
-) -> tuple:
-    """Generate one instance and return (allowed matrix, edge count)."""
-    rng = random.Random(seed)
-
-    coords = [(rng.random(), rng.random()) for _ in range(n)]
-    dist = build_distance_matrix(coords, scale)
-    allowed, edge_set = build_graph(n, k, dist, rng)
-
-    return allowed, len(edge_set)
 
 
 def main() -> None:
     args = parse_args()
-
     os.makedirs(args.outdir, exist_ok=True)
 
     base_seed = args.seed if args.seed is not None else random.randrange(2 ** 32)
@@ -333,16 +343,17 @@ def main() -> None:
     for idx in range(args.count):
         seed = base_seed + idx
 
-        allowed, num_edges = generate_instance(
+        adj, knn_edges, walk_edges = generate_instance(
             n=args.nodes,
             k=args.neighbours,
             seed=seed,
             scale=args.scale,
         )
 
-        filename = (
-            f"{args.prefix}_n{args.nodes}_k{args.neighbours}_{idx:04d}.mzn"
-        )
+        total = knn_edges + walk_edges
+        walk_frac = walk_edges / total if total > 0 else 0.0
+
+        filename = f"{args.prefix}_n{args.nodes}_k{args.neighbours}_{idx:04d}.mzn"
         filepath = os.path.join(args.outdir, filename)
 
         write_mzn(
@@ -350,11 +361,17 @@ def main() -> None:
             n=args.nodes,
             k=args.neighbours,
             seed=seed,
-            allowed=allowed,
-            num_edges=num_edges,
+            adj=adj,
+            knn_edges=knn_edges,
+            walk_edges=walk_edges,
         )
 
-        print(f"  [{idx:4d}] seed={seed:10d}  edges={num_edges:5d}  -> {filepath}")
+        flag = "  *** HIGH WALK FRACTION ***" if walk_frac > 0.20 else ""
+        print(
+            f"  [{idx:4d}] seed={seed:10d}  "
+            f"knn_edges={knn_edges:5d}  walk_edges={walk_edges:3d}  "
+            f"walk_frac={walk_frac:.3f}{flag}  -> {filepath}"
+        )
 
     print("\nDone.")
 
