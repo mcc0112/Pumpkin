@@ -96,21 +96,6 @@ struct BipartiteGraph {
 }
  
 impl BipartiteGraph {
-    //for debugging purposes
-    fn debug_print(&self) {
-        println!("BipartiteGraph:");
-        println!("  n_vars = {}", self.n_vars);
-        println!("  n_vals = {}", self.n_vals);
-        println!("  val_offset = {}", self.val_offset);
-        for (i, neighbors) in self.adj.iter().enumerate() {
-            print!("  var {} ->", i);
-            for &idx in neighbors {
-                let val = idx as i32 + 1;
-                print!(" {}(idx={})", val, idx);
-            }
-            println!();
-        }
-    }
     fn build<Var: IntegerVariable>(successors: &[Var], domains: &Domains) -> Self {
         // Finds min/max to establish size of array.
         let val_offset = successors
@@ -297,12 +282,6 @@ impl<Var: IntegerVariable + 'static> AllDifferentPropagator<Var> {
         let conjunction =
             self.make_hall_explanation(domains, &graph, &hall_vars, &hall_vals);
 
-        eprintln!(
-            "[AllDifferent] hall_vars={:?} hall_vals={:?} |conj|={}",
-            hall_vars,
-            hall_vals,
-            conjunction.len()
-        );
 
         Err(Conflict::Propagator(PropagatorConflict {
             conjunction,
