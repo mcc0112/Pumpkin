@@ -25,7 +25,7 @@ impl<Var: IntegerVariable + 'static> Constraint for Circuit<Var> {
         self,
         solver: &mut pumpkin_core::Solver,
     ) -> Result<(), pumpkin_core::ConstraintOperationError> {
-        all_different(self.successors.clone(), self.constraint_tag).post(solver)?;
+        //all_different(self.successors.clone(), self.constraint_tag).post(solver)?;
 
         CircuitConstructor {
             successors: self.successors,
@@ -39,8 +39,8 @@ impl<Var: IntegerVariable + 'static> Constraint for Circuit<Var> {
         solver: &mut pumpkin_core::Solver,
         reification_literal: pumpkin_core::variables::Literal,
     ) -> Result<(), pumpkin_core::ConstraintOperationError> {
-        all_different(self.successors.clone(), self.constraint_tag)
-            .implied_by(solver, reification_literal)?;
+        // all_different(self.successors.clone(), self.constraint_tag)
+        //     .implied_by(solver, reification_literal)?;
 
         CircuitConstructor {
             successors: self.successors,
