@@ -164,9 +164,6 @@ impl<Var: IntegerVariable + 'static> CircuitPropagator<Var> {
         }
 
         // ── Step 1: self-loop removal ────────────────────────────────────────
-        // Must happen before we snapshot domains, because removing self-loops
-        // is unconditional and idempotent; the solver will not call us with a
-        // self-loop still in a domain after the first propagation.
         for (zero_idx, var) in self.successors.iter().enumerate() {
             let self_val = index_to_domain_value(zero_idx);
             if context.contains(var, self_val) {
@@ -179,8 +176,6 @@ impl<Var: IntegerVariable + 'static> CircuitPropagator<Var> {
         }
 
         // ── Snapshot domains before any further posting ──────────────────────
-        // Every explanation builder below receives `domains` (read-only) so
-        // that all literals reflect the state at propagation entry.
         let domains = context.domains();
 
         // ── Step 2: circuit sub-cycle conflict check ─────────────────────────
@@ -195,7 +190,6 @@ impl<Var: IntegerVariable + 'static> CircuitPropagator<Var> {
         // ── Step 5: AllDifferent conflict (no perfect matching) ──────────────
         if matching.size < graph.n_vars {
             let (hall_vars, hall_vals) = find_hall_set(&graph, &matching);
-
             let conjunction =
                 self.make_hall_explanation(&domains, &graph, &hall_vars, &hall_vals);
             return Err(Conflict::Propagator(PropagatorConflict {
@@ -209,7 +203,6 @@ impl<Var: IntegerVariable + 'static> CircuitPropagator<Var> {
         let scc_id = tarjan_scc(&residual);
 
         // ── Collect all prunings (steps 7–9) before posting ─────────────────
-        // See module doc — post after all explanations are built.
         let mut prunings: Vec<(usize, i32, PropositionalConjunction, InferenceCode)> =
             Vec::new();
 
@@ -233,7 +226,6 @@ impl<Var: IntegerVariable + 'static> CircuitPropagator<Var> {
                     &hall_vars,
                     &hall_vals,
                 );
-
                 prunings.push((i, domain_val, explanation, self.alldiff_code.clone()));
             }
         }
@@ -279,20 +271,32 @@ impl<Var: IntegerVariable + 'static> CircuitPropagator<Var> {
                 continue;
             }
 
-            // Pass hs and ve so the explanation correctly distinguishes the
-            // entry variable (which may still have ve in its domain) from the
-            // other Hall variables (which must be fully confined to D(Next_H)).
-            let explanation = self.make_hall_circuit_explanation(
+            // Find the correct tight Hall set witness via BFS from exit_val's
+            // matched variable, excluding entry_var from expansion.
+            let ve_idx = domain_value_to_index(ve);
+            let (witness_vars, witness_vals) = find_hall_circuit_hall_set(
+                &graph,
+                &matching,
+                hs,
+                ve_idx,
+                &scc_id,
+            );
+
+            if witness_vars.is_empty() {
+                continue;
+            }
+
+            let explanation = self.make_pruning_explanation_from_hall(
                 &domains,
                 &graph,
-                hall_vars,
-                hall_vals,
-                hs,
-                ve,
+                &witness_vars,
+                &witness_vals,
             );
+            eprint!("hall set prunign ");
             prunings.push((hs, ve, explanation, self.hall_circuit_code.clone()));
         }
-        // // ── Step 9: circuit nocycle prevention ───────────────────────────────
+
+        // ── Step 9: circuit nocycle prevention ───────────────────────────────
         self.collect_circuit_prevent_prunings(&domains, &mut prunings, n);
 
         // ── Step 10: post all prunings ────────────────────────────────────────
@@ -549,31 +553,27 @@ impl<Var: IntegerVariable + 'static> CircuitPropagator<Var> {
     /// the values D(Next_H)". This is exactly the same witness as for AllDiff
     /// GAC pruning; we reuse the same literal construction but tag it with the
     /// `HallCircuitReason` inference code so the proof log is correct.
-    fn make_hall_circuit_explanation(
+fn make_hall_circuit_explanation(
     &self,
     domains: &Domains,
     graph: &BipartiteGraph,
-    _hall_vars: &[usize],
+    hall_vars: &[usize],
     _hall_vals: &[usize],
     entry_var: usize,
     exit_val: i32,
 ) -> PropositionalConjunction {
-    let n = self.successors.len();
+    let vars_to_explain: Vec<usize> = hall_vars
+        .iter()
+        .copied()
+        .chain(std::iter::once(entry_var))
+        .collect();
 
-    // We will encode, for every successor variable:
-    //  - its current bounds
-    //  - all disequalities for values that are currently absent from its domain
-    //
-    // This reconstructs the *exact* domain snapshot at propagation entry,
-    // except that we deliberately do NOT include (entry_var != exit_val),
-    // because that is the propagated literal we are explaining.
-
-    (0..n)
-        .flat_map(|idx| {
+    vars_to_explain
+        .iter()
+        .flat_map(|&idx| {
             let var = &self.successors[idx];
 
             if let Some(fixed) = domains.fixed_value(var) {
-                // If the variable is already fixed, just record the assignment.
                 return vec![predicate!(var == fixed)];
             }
 
@@ -581,28 +581,20 @@ impl<Var: IntegerVariable + 'static> CircuitPropagator<Var> {
             let ub = domains.upper_bound(var);
             let mut lits = vec![predicate!(var >= lb), predicate!(var <= ub)];
 
-            // Enumerate all possible values in the global value range.
-            // Values outside [lb, ub] are already excluded by the bounds.
             let min_val = graph.val_offset;
             let max_val = graph.val_offset + (graph.n_vals as i32) - 1;
 
             for d in min_val..=max_val {
                 if d <= lb || d >= ub {
-                    continue; // already excluded by bounds
+                    continue;
                 }
-
-                // Do NOT include the pruned literal itself in the reason.
                 if idx == entry_var && d == exit_val {
                     continue;
                 }
-
                 if !domains.contains(var, d) {
-                    // This value is currently absent from the domain;
-                    // record that as a disequality.
                     lits.push(predicate!(var != d));
                 }
             }
-
             lits
         })
         .collect()
@@ -866,7 +858,76 @@ fn find_hall_set(graph: &BipartiteGraph, m: &Matching) -> (Vec<usize>, Vec<usize
 
     (hall_vars, hall_vals)
 }
+fn find_hall_circuit_hall_set(
+    graph: &BipartiteGraph,
+    m: &Matching,
+    entry_var: usize,
+    exit_val_idx: usize,
+    scc_id: &[usize],
+) -> (Vec<usize>, Vec<usize>) {
+    // The tight Hall set H consists of variables whose matched values are
+    // in SCCs that contain no other variables — i.e. the values are
+    // "exclusively owned" by those variables.
+    //
+    // We find H by: starting from entry_var's matched value's SCC neighbours,
+    // collecting all variables whose matched val SCC contains only that val
+    // and no other vars.
+    //
+    // Concretely: a val v is "tight" if its SCC contains no variables.
+    // A var i is in H if its matched val is tight AND i != entry_var.
+    // We verify |H| == |N(H)| to confirm it is a tight Hall set.
 
+    let n_vars = graph.n_vars;
+    let n_vals = graph.n_vals;
+
+    // Find all val SCCs that contain no variables.
+    let mut val_scc_has_var = vec![false; scc_id.iter().copied().max().unwrap_or(0) + 1];
+    for i in 0..n_vars {
+        val_scc_has_var[scc_id[i]] = true;
+    }
+
+    // A value is "isolated" (exclusively owned) if its SCC has no variables.
+    let val_is_isolated: Vec<bool> = (0..n_vals)
+        .map(|v| !val_scc_has_var[scc_id[n_vars + v]])
+        .collect();
+
+    // H = all variables (excluding entry_var) whose matched value is isolated.
+    let hall_vars: Vec<usize> = (0..n_vars)
+        .filter(|&i| {
+            if i == entry_var {
+                return false;
+            }
+            let mv = m.match_var[i];
+            mv != UNMATCHED && val_is_isolated[mv]
+        })
+        .collect();
+
+    if hall_vars.is_empty() {
+        return (vec![], vec![]);
+    }
+
+    // N(H) = all values reachable from any variable in H.
+    let mut val_in_nh = vec![false; n_vals];
+    for &h in &hall_vars {
+        for &v in &graph.adj[h] {
+            val_in_nh[v] = true;
+        }
+    }
+    let hall_vals: Vec<usize> = (0..n_vals).filter(|&v| val_in_nh[v]).collect();
+
+    // Verify tight Hall condition: |H| == |N(H)|.
+    if hall_vars.len() != hall_vals.len() {
+        return (vec![], vec![]);
+    }
+
+    // Verify exit_val is reachable from entry_var but not in N(H).
+    // (If exit_val were in N(H), the pruning would be wrong.)
+    if val_in_nh[exit_val_idx] {
+        return (vec![], vec![]);
+    }
+
+    (hall_vars, hall_vals)
+}
 // ─── Hall set extraction (pruning) ───────────────────────────────────────────
 
 /// BFS from the variable currently matched to `pruned_val`, collecting the
