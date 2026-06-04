@@ -18,10 +18,7 @@
 //! 10. Post all collected prunings.
 //!
 //! Three distinct [`InferenceCode`]s are used so the proof log can attribute
-//! each pruning to the correct reasoning:
-//!   - `AllDifferentReason`  — steps 5 & 7
-//!   - `CircuitReason`       — steps 2 & 9
-//!   - `HallCircuitReason`   — step 8  (the novel Variant 3 contribution)
+//! each pruning to the correct reasoning
 
 use fixedbitset::FixedBitSet;
 use pumpkin_core::declare_inference_label;
@@ -46,26 +43,15 @@ use pumpkin_core::conjunction;
 
 use crate::circuit::CircuitChecker;
 
-//use crate::hamiltonian_checker::HamiltonianChecker;
 
 // ─── Inference labels ────────────────────────────────────────────────────────
 
 declare_inference_label!(AllDifferentReason);
 declare_inference_label!(CircuitReason);
-/// New label: prunings derived from Hall-set structure applied to the circuit
-/// constraint (Bertagnon & Gavanelli, Theorem 4.2).
 declare_inference_label!(HallCircuitReason);
 
-// ─── Constructor ─────────────────────────────────────────────────────────────
-
-/// Constructor for the unified Hamiltonian propagator.
-///
-/// Register this with the solver instead of separate `AllDifferentConstructor`
-/// and `CircuitConstructor` instances when using Variant 3.
 #[derive(Debug, Clone)]
 pub struct CircuitConstructor<Var> {
-    /// `successors[i]` is the variable whose value is the 1-indexed successor
-    /// of node `i+1` in the Hamiltonian cycle.
     pub successors: Box<[Var]>,
     pub constraint_tag: ConstraintTag,
 }
@@ -74,8 +60,6 @@ impl<Var: IntegerVariable + 'static> PropagatorConstructor for CircuitConstructo
     type PropagatorImpl = CircuitPropagator<Var>;
 
     fn create(self, mut context: PropagatorConstructorContext) -> Self::PropagatorImpl {
-        // Register on ANY_INT so that both bound changes (needed for AllDiff
-        // GAC) and assignment events (needed for circuit) wake the propagator.
         self.successors
             .iter()
             .enumerate()
@@ -114,26 +98,21 @@ impl<Var: IntegerVariable + 'static> PropagatorConstructor for CircuitConstructo
     }
 }
 
-// ─── Propagator struct ────────────────────────────────────────────────────────
-
 #[derive(Debug, Clone)]
 pub struct CircuitPropagator<Var> {
     successors: Box<[Var]>,
     first_iteration: bool,
     alldiff_code: InferenceCode,
     circuit_code: InferenceCode,
-    /// Inference code for Theorem 4.2 Hall-circuit prunings.
     hall_circuit_code: InferenceCode,
 }
 
-// ─── Propagator trait impl ────────────────────────────────────────────────────
 
 impl<Var: IntegerVariable + 'static> Propagator for CircuitPropagator<Var> {
     fn name(&self) -> &str {
         "Circuit"
     }
 
-    // Option A: move self-loop removal into propagate only, before calling run
     fn propagate(&mut self, mut context: PropagationContext) -> PropagationStatusCP {
         if self.first_iteration {
             self.first_iteration = false;
@@ -143,7 +122,7 @@ impl<Var: IntegerVariable + 'static> Propagator for CircuitPropagator<Var> {
     }
 
     fn propagate_from_scratch(&self, mut context: PropagationContext) -> PropagationStatusCP {
-        self.remove_self_loops(&mut context)?; // always needed from scratch
+        self.remove_self_loops(&mut context)?; 
         self.run(context)
     }
 }
@@ -153,17 +132,14 @@ impl<Var: IntegerVariable + 'static> Propagator for CircuitPropagator<Var> {
 impl<Var: IntegerVariable + 'static> CircuitPropagator<Var> {
     /// Full propagation pipeline.
     ///
-    /// All explanation literals are computed from the domain snapshot taken at
-    /// the start of `propagate` (via `context.domains()`), before any
-    /// `context.post` call mutates the state. This is the fundamental LCG
-    /// correctness requirement.
+    /// Explanations are made eagerly
     fn run(&self, mut context: PropagationContext) -> PropagationStatusCP {
         let n = self.successors.len();
         if n == 0 {
             return Ok(());
         }
 
-        // ── Step 1: self-loop removal ────────────────────────────────────────
+        // Step 1: Self-loop removal 
         for (zero_idx, var) in self.successors.iter().enumerate() {
             let self_val = index_to_domain_value(zero_idx);
             if context.contains(var, self_val) {
@@ -175,19 +151,19 @@ impl<Var: IntegerVariable + 'static> CircuitPropagator<Var> {
             }
         }
 
-        // ── Snapshot domains before any further posting ──────────────────────
+        //Snapshot of domains before posting
         let domains = context.domains();
 
-        // ── Step 2: circuit sub-cycle conflict check ─────────────────────────
+        // Step 2: Check -> no subcycle
         self.circuit_check(&domains)?;
 
-        // ── Step 3: build bipartite graph ────────────────────────────────────
+        // Step 3: build bipartite graph
         let graph = BipartiteGraph::build(&self.successors, &domains);
 
-        // ── Step 4: maximum matching ─────────────────────────────────────────
+        // Step 4: run matching
         let matching = hopcroft_karp(&graph);
 
-        // ── Step 5: AllDifferent conflict (no perfect matching) ──────────────
+        // Step 5: all different conflict -> no perfect match
         if matching.size < graph.n_vars {
             let (hall_vars, hall_vals) = find_hall_set(&graph, &matching);
             let conjunction =
@@ -198,15 +174,15 @@ impl<Var: IntegerVariable + 'static> CircuitPropagator<Var> {
             }));
         }
 
-        // ── Step 6: residual graph + SCCs ────────────────────────────────────
+        // Step 6: Residual graph + SCCs
         let residual = ResidualGraph::build(&graph, &matching);
         let scc_id = tarjan_scc(&residual);
 
-        // ── Collect all prunings (steps 7–9) before posting ─────────────────
+        // Collect pruning - make explanations eagerly
         let mut prunings: Vec<(usize, i32, PropositionalConjunction, InferenceCode)> =
             Vec::new();
 
-        // ── Step 7: GAC AllDifferent pruning (SCC-based) ─────────────────────
+        // Step 7: GAC AllDifferent pruning (SCC-based)
         for i in 0..graph.n_vars {
             let matched_val = matching.match_var[i];
             for &v in &graph.adj[i] {
@@ -230,7 +206,7 @@ impl<Var: IntegerVariable + 'static> CircuitPropagator<Var> {
             }
         }
 
-        // ── Step 8: Hall-circuit pruning (Theorem 4.2) ───────────────────────
+        // Step 8: Hall-circuit pruning (Theorem 4.2) 
         let tight_hall_sets = collect_tight_hall_sets(&graph, &scc_id);
         for (hall_vars, hall_vals) in &tight_hall_sets {
             if hall_vars.len() >= n {
@@ -270,9 +246,6 @@ impl<Var: IntegerVariable + 'static> CircuitPropagator<Var> {
             if !domains.contains(&self.successors[hs], ve) {
                 continue;
             }
-
-            // Find the correct tight Hall set witness via BFS from exit_val's
-            // matched variable, excluding entry_var from expansion.
             let ve_idx = domain_value_to_index(ve);
             let (witness_vars, witness_vals) = find_hall_circuit_hall_set(
                 &graph,
@@ -292,14 +265,13 @@ impl<Var: IntegerVariable + 'static> CircuitPropagator<Var> {
                 &witness_vars,
                 &witness_vals,
             );
-            eprint!("hall set prunign ");
             prunings.push((hs, ve, explanation, self.hall_circuit_code.clone()));
         }
 
-        // ── Step 9: circuit nocycle prevention ───────────────────────────────
+        // Step 9: circuit prevent 
         self.collect_circuit_prevent_prunings(&domains, &mut prunings, n);
 
-        // ── Step 10: post all prunings ────────────────────────────────────────
+        // post all prunings
         for (var_idx, domain_val, reason, code) in prunings {
             let var = &self.successors[var_idx];
             if context.contains(var, domain_val) {
@@ -311,8 +283,7 @@ impl<Var: IntegerVariable + 'static> CircuitPropagator<Var> {
     }
 }
 
-// ─── Circuit reasoning ────────────────────────────────────────────────────────
-
+// CIRCUIT REASONING
 impl<Var: IntegerVariable + 'static> CircuitPropagator<Var> {
     fn remove_self_loops(&self, context: &mut PropagationContext) -> PropagationStatusCP {
         for (zero_indexed_node, domain_of_one_indexed_node) in self.successors.iter().enumerate() {
@@ -325,11 +296,6 @@ impl<Var: IntegerVariable + 'static> CircuitPropagator<Var> {
         Ok(())
     }
     
-    
-    /// Detect sub-cycles among fixed (assigned) edges.
-    ///
-    /// A sub-cycle of length < n over fixed edges is a definite conflict.
-    /// A cycle of length exactly n over fixed edges is a valid Hamiltonian cycle.
     fn circuit_check(&self, domains: &Domains) -> PropagationStatusCP {
         let n = self.successors.len();
         for start in 0..n {
@@ -456,11 +422,9 @@ impl<Var: IntegerVariable + 'static> CircuitPropagator<Var> {
     }
 }
 
-// ─── AllDifferent explanation helpers ────────────────────────────────────────
-
+//ALLDIFFERENT EXPLANATION HELPERS
 impl<Var: IntegerVariable + 'static> CircuitPropagator<Var> {
-    /// Explanation for an AllDifferent conflict: the combined domain of
-    /// `hall_vars` is restricted to `hall_vals`, but |hall_vars| > |hall_vals|.
+
     fn make_hall_explanation(
         &self,
         domains: &Domains,
@@ -503,8 +467,6 @@ impl<Var: IntegerVariable + 'static> CircuitPropagator<Var> {
             .collect()
     }
 
-    /// Explanation for an AllDifferent GAC pruning: the tight Hall set (H, V)
-    /// shows why variable `pruned_var` cannot take a value in V.
     fn make_pruning_explanation_from_hall(
         &self,
         domains: &Domains,
@@ -547,63 +509,9 @@ impl<Var: IntegerVariable + 'static> CircuitPropagator<Var> {
             .collect()
     }
 
-    /// Explanation for a **Hall-circuit** pruning (Theorem 4.2).
-    ///
-    /// The witness is: "each variable in the tight Hall set H is confined to
-    /// the values D(Next_H)". This is exactly the same witness as for AllDiff
-    /// GAC pruning; we reuse the same literal construction but tag it with the
-    /// `HallCircuitReason` inference code so the proof log is correct.
-fn make_hall_circuit_explanation(
-    &self,
-    domains: &Domains,
-    graph: &BipartiteGraph,
-    hall_vars: &[usize],
-    _hall_vals: &[usize],
-    entry_var: usize,
-    exit_val: i32,
-) -> PropositionalConjunction {
-    let vars_to_explain: Vec<usize> = hall_vars
-        .iter()
-        .copied()
-        .chain(std::iter::once(entry_var))
-        .collect();
-
-    vars_to_explain
-        .iter()
-        .flat_map(|&idx| {
-            let var = &self.successors[idx];
-
-            if let Some(fixed) = domains.fixed_value(var) {
-                return vec![predicate!(var == fixed)];
-            }
-
-            let lb = domains.lower_bound(var);
-            let ub = domains.upper_bound(var);
-            let mut lits = vec![predicate!(var >= lb), predicate!(var <= ub)];
-
-            let min_val = graph.val_offset;
-            let max_val = graph.val_offset + (graph.n_vals as i32) - 1;
-
-            for d in min_val..=max_val {
-                if d <= lb || d >= ub {
-                    continue;
-                }
-                if idx == entry_var && d == exit_val {
-                    continue;
-                }
-                if !domains.contains(var, d) {
-                    lits.push(predicate!(var != d));
-                }
-            }
-            lits
-        })
-        .collect()
 }
 
-}
-
-// ─── Tight Hall set extraction ────────────────────────────────────────────────
-
+// TIGHT HALL SET EXTRACTION 
 /// After running Tarjan's SCC on the residual graph, collect all SCCs that
 /// form tight Hall sets: groups where the number of variable-nodes equals the
 /// number of value-nodes, and neither equals n (the full graph).
@@ -647,14 +555,11 @@ fn collect_tight_hall_sets(
     result
 }
 
-// ─── Bipartite graph ──────────────────────────────────────────────────────────
-
+//BIPARTITE GRAPH
 struct BipartiteGraph {
     n_vars: usize,
     n_vals: usize,
-    /// `adj[i]` = list of 0-indexed value positions reachable from variable i.
     adj: Vec<Vec<usize>>,
-    /// Maps 0-indexed value position → actual domain value: `val_offset + idx`.
     val_offset: i32,
 }
 
@@ -702,7 +607,7 @@ impl BipartiteGraph {
     }
 }
 
-// ─── Hopcroft-Karp matching ───────────────────────────────────────────────────
+//Hopcroft-Karp matching 
 
 const UNMATCHED: usize = usize::MAX;
 const INF_DIST: usize = usize::MAX;
@@ -817,10 +722,7 @@ fn dfs_augment_iterative(
     false
 }
 
-// ─── Hall set extraction (conflict) ──────────────────────────────────────────
-
-/// BFS from unmatched variables to identify the Hall set that witnesses the
-/// AllDifferent conflict.
+// HALL SET EXTRACTION (CONFLICT)
 fn find_hall_set(graph: &BipartiteGraph, m: &Matching) -> (Vec<usize>, Vec<usize>) {
     let mut var_visited = vec![false; graph.n_vars];
     let mut val_visited = vec![false; graph.n_vals];
@@ -858,6 +760,7 @@ fn find_hall_set(graph: &BipartiteGraph, m: &Matching) -> (Vec<usize>, Vec<usize
 
     (hall_vars, hall_vals)
 }
+
 fn find_hall_circuit_hall_set(
     graph: &BipartiteGraph,
     m: &Matching,
@@ -928,10 +831,9 @@ fn find_hall_circuit_hall_set(
 
     (hall_vars, hall_vals)
 }
-// ─── Hall set extraction (pruning) ───────────────────────────────────────────
 
-/// BFS from the variable currently matched to `pruned_val`, collecting the
-/// tight Hall set that justifies pruning `pruned_val` from `pruned_var`.
+
+// HALL SET EXTRACTION PRUNING - GAC
 fn find_pruning_hall_set(
     graph: &BipartiteGraph,
     m: &Matching,
@@ -983,8 +885,7 @@ fn find_pruning_hall_set(
     (hall_vars, hall_vals)
 }
 
-// ─── Residual graph ───────────────────────────────────────────────────────────
-
+//RESIDUAL GRAPH
 struct ResidualGraph {
     n_nodes: usize,
     adj: Vec<Vec<usize>>,
@@ -1039,8 +940,7 @@ impl ResidualGraph {
     }
 }
 
-// ─── Tarjan SCC ───────────────────────────────────────────────────────────────
-
+// TARJAN SCC
 const UNVISITED: usize = usize::MAX;
 
 struct TarjanState {
@@ -1132,8 +1032,7 @@ fn tarjan_visit(start: usize, adj: &[Vec<usize>], state: &mut TarjanState) {
     }
 }
 
-// ─── Index / value helpers ────────────────────────────────────────────────────
-
+//INDEX/VALUE HELPERS
 const VALUE_OFFSET: usize = 1;
 
 #[inline]
@@ -1146,16 +1045,14 @@ fn index_to_domain_value(index: usize) -> i32 {
     index as i32 + VALUE_OFFSET as i32
 }
 
-// ─── Tests ────────────────────────────────────────────────────────────────────
-
+// TESTS
 #[cfg(test)]
 mod tests {
     use super::*;
     use pumpkin_core::state::State;
     use pumpkin_core::variables::DomainId;
 
-    // ── Helpers ──────────────────────────────────────────────────────────────
-
+    // HELPERS
     fn make_state(domains: &[(i32, i32)]) -> State {
         let mut state = State::default();
         let vars: Box<[_]> = domains
@@ -1283,30 +1180,6 @@ mod tests {
 
     // ── Hall-circuit (Theorem 4.2) tests ─────────────────────────────────────
 
-    /// Core Theorem 4.2 test.
-    ///
-    /// Setup (4 nodes):
-    ///   x0 ∈ {2,3}   x1 ∈ {2,3}   x2 ∈ {1,4}   x3 ∈ {1,4}
-    ///
-    /// The pair {x0, x1} forms a tight Hall set H = {x0, x1} with
-    /// D(Next_H) = {2, 3}. Here H = {node1, node2} (1-indexed) and
-    /// D(Next_H) = {2, 3} so H ∩ D(Next_H) = {2, 3} — but wait, after
-    /// self-loop removal x1 loses value 2. Let's use a simpler 4-node layout:
-    ///
-    ///   x0 ∈ {2,3}   x1 ∈ {3,4}   x2 ∈ {1,2}   x3 ∈ {1,4}
-    ///
-    /// After self-loop removal:
-    ///   x0 ∈ {2,3} (no self-loop since node 1 can't take 1)
-    ///   x1 ∈ {3,4} (node 2 self-loop would be 2 → already absent)
-    ///   x2 ∈ {1,2} (node 3 self-loop is 3 → absent)
-    ///   x3 ∈ {1,4} — self-loop is 4 → pruned to {1}
-    ///
-    /// With x3 fixed to 1, node 4 → node 1. Then {x0, x1, x2} must cover
-    /// nodes 2,3,4. The Hall-circuit reasoning should derive that the ain
-    /// can be detected and the premature closing edge blocked.
-    ///
-    /// This is a structural smoke test — the key assertion is no panic/crash
-    /// and that the propagator terminates with the correct result.
     #[test]
     fn hall_circuit_theorem42_no_premature_close() {
         // 4-node graph; after self-loop removal x3 is forced.
