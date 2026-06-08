@@ -1,3 +1,4 @@
+use pumpkin_core::create_statistics_struct;
 use pumpkin_core::declare_inference_label;
 use pumpkin_core::proof::ConstraintTag;
 use pumpkin_core::proof::InferenceCode;
@@ -7,6 +8,7 @@ use pumpkin_core::propagation::Propagator;
 use pumpkin_core::propagation::PropagatorConstructor;
 use pumpkin_core::propagation::PropagatorConstructorContext;
 use pumpkin_core::propagation::ReadDomains;
+use pumpkin_core::statistics::Statistic;
 use pumpkin_core::variables::IntegerVariable;
 use pumpkin_core::propagation::DomainEvents;
 use pumpkin_core::propagation::LocalId;
@@ -25,7 +27,15 @@ pub struct AllDifferentConstructor<Var> {
     pub constraint_tag: ConstraintTag,
 }
 declare_inference_label!(AllDifferent);
-
+create_statistics_struct!(AllDifferentV1Statistics {
+    // Hall set size tracking: S is the violating set
+    total_hall_set_size: usize,       // sum of |S| across all conflicts
+    number_of_conflicts: usize,       // divide above for average |S|
+    max_hall_set_size: usize,         // largest |S| seen
+    // Propagation counts
+    propagations_total: usize,
+    propagations_that_found_conflict: usize, 
+});
 impl<Var: IntegerVariable + 'static> PropagatorConstructor for AllDifferentConstructor<Var> {
     type PropagatorImpl = AllDifferentPropagator<Var>;
 
@@ -48,6 +58,8 @@ impl<Var: IntegerVariable + 'static> PropagatorConstructor for AllDifferentConst
         AllDifferentPropagator {
             sucs: self.sucs,
             inference_code: InferenceCode::new(self.constraint_tag, AllDifferent),
+            statistics: AllDifferentV1Statistics::default(),  
+
         }
     }
 
@@ -65,14 +77,38 @@ impl<Var: IntegerVariable + 'static> PropagatorConstructor for AllDifferentConst
 pub struct AllDifferentPropagator<Var> {
     sucs: Box<[Var]>,
     inference_code: InferenceCode,
+    statistics: AllDifferentV1Statistics,
 }
 
 impl<Var: IntegerVariable + 'static> Propagator for AllDifferentPropagator<Var> {
     fn name(&self) -> &str {
         "AllDifferent"
     }
+    fn log_statistics(&self, statistic_logger: pumpkin_core::statistics::StatisticLogger) {
+        self.statistics.log(statistic_logger);
+    }
     fn propagate(&mut self, mut context: PropagationContext) -> pumpkin_core::state::PropagationStatusCP {
-        self.check_matching_conflict(context.domains())
+        self.statistics.propagations_total += 1;
+
+        let result = self.check_matching_conflict(context.domains());
+        if let Err(_) = &result {
+            self.statistics.propagations_that_found_conflict +=1;
+            // Record Hall set size at conflict time
+            // Re-extract it here since check_matching_conflict doesn't return it
+            let graph = BipartiteGraph::build(&self.sucs, &context.domains());
+            let matching = hopcroft_karp(&graph);
+            if matching.size < graph.n_vars {
+                let (hall_vars, _) = find_hall_set(&graph, &matching);
+                let s = hall_vars.len();
+                self.statistics.total_hall_set_size += s;
+                self.statistics.number_of_conflicts += 1;
+                if s > self.statistics.max_hall_set_size {
+                    self.statistics.max_hall_set_size = s;
+                }
+            }
+        }
+
+        result
     }
 
     fn propagate_from_scratch(
