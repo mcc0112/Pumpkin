@@ -42,7 +42,41 @@ use pumpkin_core::variables::IntegerVariable;
 use pumpkin_core::conjunction;
 
 use crate::circuit::CircuitChecker;
+use pumpkin_core::create_statistics_struct;
+use pumpkin_core::statistics::Statistic;
 
+create_statistics_struct!(CircuitV3Statistics {
+    propagations_total: usize,
+
+    // Conflict sources
+    circuit_conflicts: usize,          // from circuit_check
+    alldiff_conflicts: usize,          // from Hall violation (no perfect matching)
+
+    // Failure depth (three-way comparison with V0/V1/V2)
+    total_fixed_edges_at_conflict: usize,
+    number_of_conflicts: usize,
+
+    // GAC pruning (same as V2 AllDifferent component)
+    gac_prunings: usize,               // values removed by SCC step
+    propagations_that_gac_pruned: usize,
+    total_pruning_hall_set_size: usize,
+    number_of_pruning_explanations: usize,
+    max_pruning_hall_set_size: usize,
+
+    // SCC concentration (same as V2)
+    total_scc_size_at_pruning: usize,
+    number_of_scc_pruning_calls: usize,
+    total_vars_involved_in_pruning: usize,
+    max_values_pruned_from_single_var: usize,
+
+    // Hall-circuit step specifically (V3-unique)
+    hall_circuit_checks: usize,        // tight Hall sets examined
+    hall_circuit_prunings: usize,      // edges actually pruned by Theorem 4.2
+    // entry_exit_check_fired is hall_circuit_prunings > 0 per call, derivable
+
+    // Circuit prevent pruning
+    circuit_prevent_prunings: usize,
+});
 
 // ─── Inference labels ────────────────────────────────────────────────────────
 
@@ -82,6 +116,8 @@ impl<Var: IntegerVariable + 'static> PropagatorConstructor for CircuitConstructo
             alldiff_code: InferenceCode::new(self.constraint_tag, AllDifferentReason),
             circuit_code: InferenceCode::new(self.constraint_tag, CircuitReason),
             hall_circuit_code: InferenceCode::new(self.constraint_tag, HallCircuitReason),
+            statistics: CircuitV3Statistics::default(),
+
         }
     }
 
@@ -105,6 +141,7 @@ pub struct CircuitPropagator<Var> {
     alldiff_code: InferenceCode,
     circuit_code: InferenceCode,
     hall_circuit_code: InferenceCode,
+    statistics: CircuitV3Statistics,  // add this
 }
 
 
@@ -112,13 +149,17 @@ impl<Var: IntegerVariable + 'static> Propagator for CircuitPropagator<Var> {
     fn name(&self) -> &str {
         "Circuit"
     }
+    fn log_statistics(&self, statistic_logger: pumpkin_core::statistics::StatisticLogger) {
+        self.statistics.log(statistic_logger);
+    }
 
     fn propagate(&mut self, mut context: PropagationContext) -> PropagationStatusCP {
+        self.statistics.propagations_total += 1;
         if self.first_iteration {
             self.first_iteration = false;
             self.remove_self_loops(&mut context)?;
         }
-        self.run(context)
+        self.run_with_stats(context)
     }
 
     fn propagate_from_scratch(&self, mut context: PropagationContext) -> PropagationStatusCP {
@@ -272,6 +313,150 @@ impl<Var: IntegerVariable + 'static> CircuitPropagator<Var> {
         self.collect_circuit_prevent_prunings(&domains, &mut prunings, n);
 
         // post all prunings
+        for (var_idx, domain_val, reason, code) in prunings {
+            let var = &self.successors[var_idx];
+            if context.contains(var, domain_val) {
+                context.post(predicate!(var != domain_val), reason, &code)?;
+            }
+        }
+
+        Ok(())
+    }
+    fn run_with_stats(&mut self, mut context: PropagationContext) -> PropagationStatusCP {
+        let n = self.successors.len();
+        if n == 0 { return Ok(()); }
+
+        // Self-loop removal (same as run)
+        for (zero_idx, var) in self.successors.iter().enumerate() {
+            let self_val = index_to_domain_value(zero_idx);
+            if context.contains(var, self_val) {
+                context.post(predicate!(var != self_val), conjunction!(), &self.circuit_code)?;
+            }
+        }
+
+        let domains = context.domains();
+
+        // Step 2: circuit check — instrument conflict
+        let check_result = self.circuit_check(&domains);
+        if check_result.is_err() {
+            self.statistics.circuit_conflicts += 1;
+            self.statistics.number_of_conflicts += 1;
+            self.statistics.total_fixed_edges_at_conflict += self.successors.iter()
+                .filter(|s| domains.fixed_value(*s).is_some())
+                .count();
+            return check_result;
+        }
+
+        let graph = BipartiteGraph::build(&self.successors, &domains);
+        let matching = hopcroft_karp(&graph);
+
+        // Step 5: AllDifferent conflict — instrument
+        if matching.size < graph.n_vars {
+            self.statistics.alldiff_conflicts += 1;
+            self.statistics.number_of_conflicts += 1;
+            self.statistics.total_fixed_edges_at_conflict += self.successors.iter()
+                .filter(|s| domains.fixed_value(*s).is_some())
+                .count();
+            let (hall_vars, hall_vals) = find_hall_set(&graph, &matching);
+            let conjunction = self.make_hall_explanation(&domains, &graph, &hall_vars, &hall_vals);
+            return Err(Conflict::Propagator(PropagatorConflict {
+                conjunction,
+                inference_code: self.alldiff_code.clone(),
+            }));
+        }
+
+        let residual = ResidualGraph::build(&graph, &matching);
+        let scc_id = tarjan_scc(&residual);
+
+        let mut prunings: Vec<(usize, i32, PropositionalConjunction, InferenceCode)> = Vec::new();
+
+        // Step 7: GAC pruning — instrument per-call concentration metrics
+        let mut pruned_per_var = vec![0usize; graph.n_vars];
+        let mut counted_sccs = std::collections::HashSet::new();
+        let mut gac_this_call = 0usize;
+
+        for i in 0..graph.n_vars {
+            let matched_val = matching.match_var[i];
+            for &v in &graph.adj[i] {
+                if v == matched_val { continue; }
+                let val_node = graph.n_vars + v;
+                if scc_id[i] == scc_id[val_node] { continue; }
+
+                let domain_val = v as i32 + graph.val_offset;
+                let (hall_vars, hall_vals) = find_pruning_hall_set(&graph, &matching, i, v);
+
+                let t = hall_vars.len();
+                self.statistics.total_pruning_hall_set_size += t;
+                self.statistics.number_of_pruning_explanations += 1;
+                if t > self.statistics.max_pruning_hall_set_size {
+                    self.statistics.max_pruning_hall_set_size = t;
+                }
+
+                if counted_sccs.insert(scc_id[val_node]) {
+                    let scc_size = scc_id.iter().filter(|&&s| s == scc_id[val_node]).count();
+                    self.statistics.total_scc_size_at_pruning += scc_size;
+                }
+
+                let explanation = self.make_pruning_explanation_from_hall(&domains, &graph, &hall_vars, &hall_vals);
+                prunings.push((i, domain_val, explanation, self.alldiff_code.clone()));
+                pruned_per_var[i] += 1;
+                gac_this_call += 1;
+            }
+        }
+
+        if gac_this_call > 0 {
+            self.statistics.gac_prunings += gac_this_call;
+            self.statistics.propagations_that_gac_pruned += 1;
+            self.statistics.number_of_scc_pruning_calls += 1;
+            let vars_involved = pruned_per_var.iter().filter(|&&c| c > 0).count();
+            self.statistics.total_vars_involved_in_pruning += vars_involved;
+            let max_single = pruned_per_var.iter().copied().max().unwrap_or(0);
+            if max_single > self.statistics.max_values_pruned_from_single_var {
+                self.statistics.max_values_pruned_from_single_var = max_single;
+            }
+        }
+
+        // Step 8: Hall-circuit pruning — instrument
+        let tight_hall_sets = collect_tight_hall_sets(&graph, &scc_id);
+        self.statistics.hall_circuit_checks += tight_hall_sets.len();
+
+        for (hall_vars, hall_vals) in &tight_hall_sets {
+            if hall_vars.len() >= n { continue; }
+
+            let hall_val_as_domain: Vec<i32> = hall_vals.iter()
+                .map(|&v| v as i32 + graph.val_offset).collect();
+            let i_set: Vec<usize> = hall_vars.iter().copied()
+                .filter(|&h| !hall_val_as_domain.contains(&index_to_domain_value(h)))
+                .collect();
+            let o_set: Vec<i32> = hall_val_as_domain.iter().copied()
+                .filter(|&dv| !hall_vars.contains(&domain_value_to_index(dv)))
+                .collect();
+
+            if i_set.len() != 1 || o_set.len() != 1 { continue; }
+
+            let hs = i_set[0];
+            let ve = o_set[0];
+            if !domains.contains(&self.successors[hs], ve) { continue; }
+
+            let ve_idx = domain_value_to_index(ve);
+            let (witness_vars, witness_vals) = find_hall_circuit_hall_set(
+                &graph, &matching, hs, ve_idx, &scc_id,
+            );
+            if witness_vars.is_empty() { continue; }
+
+            let explanation = self.make_pruning_explanation_from_hall(
+                &domains, &graph, &witness_vars, &witness_vals,
+            );
+            prunings.push((hs, ve, explanation, self.hall_circuit_code.clone()));
+            self.statistics.hall_circuit_prunings += 1;  // fired here
+        }
+
+        // Step 9: circuit prevent
+        let prev_len = prunings.len();
+        self.collect_circuit_prevent_prunings(&domains, &mut prunings, n);
+        self.statistics.circuit_prevent_prunings += prunings.len() - prev_len;
+
+        // Post all prunings
         for (var_idx, domain_val, reason, code) in prunings {
             let var = &self.successors[var_idx];
             if context.contains(var, domain_val) {
