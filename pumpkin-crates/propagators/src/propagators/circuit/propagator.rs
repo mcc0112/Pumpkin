@@ -1,5 +1,6 @@
 use fixedbitset::FixedBitSet;
 use pumpkin_core::conjunction;
+use pumpkin_core::create_statistics_struct;
 use pumpkin_core::declare_inference_label;
 use pumpkin_core::predicate;
 use pumpkin_core::predicates::PropositionalConjunction;
@@ -15,6 +16,7 @@ use pumpkin_core::propagation::ReadDomains;
 use pumpkin_core::state::Conflict;
 use pumpkin_core::state::PropagationStatusCP;
 use pumpkin_core::state::PropagatorConflict;
+use pumpkin_core::statistics::Statistic;
 use pumpkin_core::variables::IntegerVariable;
 use pumpkin_core::propagation::InferenceCheckers;
 
@@ -35,6 +37,7 @@ pub struct CircuitPropagator<Var> {
     pub successors: Box<[Var]>,
     // fields (and maybe extra ones)
     inference_code: InferenceCode,
+    statistics: CircuitBaseStatistics,
 }
 
 // The whole propagator constructor itself
@@ -74,8 +77,10 @@ where
             first_iteration: true, 
             successors: self.successors,
             inference_code: InferenceCode::new(self.constraint_tag, CircuitPrevent),
+            statistics: CircuitBaseStatistics::default(),
         }
     }
+    
     
     // inference checker
     fn add_inference_checkers(&self, mut checkers: InferenceCheckers<'_>) {
@@ -90,28 +95,60 @@ where
 
 declare_inference_label!(CircuitPrevent);
 
+create_statistics_struct!(CircuitBaseStatistics {
+    //how many propgation calls were triggered by ASSIGN evnet vs other domain changes
+    propagations_triggered_by_assign: usize,
+    //Failure depth: total fixed edges at time of each conflic
+    //Dividing by the number of conflict (post processing - average dept)
+    total_fixed_edges_at_conflict: usize,
+    number_of_conflicts: usize,
+    //Did propgation do useful work 
+    propagations_that_pruned: usize, 
+    propagations_total: usize,
+
+});
 
 // here comes an implementation of Propagator which has some basic functions (like defining the name) but also important functions propagate() and propagate_from_scratch()
 impl<Var: IntegerVariable + 'static> Propagator for CircuitPropagator<Var> {
     fn name(&self) -> &str {
     "Circuit"
     }
+     fn propagate_from_scratch(&self, mut context: PropagationContext) -> PropagationStatusCP {
+        self.remove_self_loops(&mut context)?;
+        self.check(context.domains())?;
+        self.prevent(&mut context)
+    }
+
+    fn log_statistics(&self, statistic_logger: pumpkin_core::statistics::StatisticLogger) {
+        self.statistics.log(statistic_logger);
+    }
     fn propagate(&mut self, mut context: PropagationContext) -> PropagationStatusCP {
-        // If it is the first iteration, then we remove self-loops
+        self.statistics.propagations_total += 1;
+        self.statistics.propagations_triggered_by_assign +=1;
+
         if self.first_iteration {
             self.first_iteration = false;
             self.remove_self_loops(&mut context)?;
         }
 
-        self.check(context.domains())?;
-        self.prevent(context)
+        let pruned_before = self.count_fixed(&mut context);  // see Step 6
+        
+        let check_result = self.check_with_stats(&mut context);  // see Step 5
+        if check_result.is_err() {
+            return check_result;
+        }
+
+         self.prevent(&mut context)?;
+
+        let pruned_after = self.count_fixed( &mut context);
+        if pruned_after > pruned_before {
+            self.statistics.propagations_that_pruned += 1;
+        }
+
+        Ok(())
     }
     
-    fn propagate_from_scratch(&self, mut context: PropagationContext) -> PropagationStatusCP {
-        self.remove_self_loops(&mut context)?;
-        self.check(context.domains())?;
-        self.prevent(context)
-    }
+   
 
 
     // defining name, but also priority (?), notify (?), notify__backtrack (?), propagate (when is this called), propagate_from_scratch (and when this? and why was this not implemented in reference)
@@ -131,7 +168,7 @@ impl<Var: IntegerVariable + 'static> CircuitPropagator<Var> {
 }
 
 impl<Var: IntegerVariable + 'static> CircuitPropagator<Var> {
-    fn prevent(&self, mut context: PropagationContext) -> PropagationStatusCP {
+    fn prevent(&self, context:&mut PropagationContext) -> PropagationStatusCP {
         // collect all nodes that have an incoming enforced/fixed edge, these cannot be start of possible chains
         let mut has_incoming_edge = FixedBitSet::with_capacity(self.successors.len());
         // for every fixed edge we find, we follow it and add the resulting node to the list
@@ -254,6 +291,23 @@ impl<Var: IntegerVariable + 'static> CircuitPropagator<Var> {
 
         }
         Ok(())
+    }
+    fn check_with_stats(&mut self, context: &mut PropagationContext) -> PropagationStatusCP {
+        let result = self.check(context.domains());
+        if result.is_err() {
+            // Count fixed edges as depth proxy
+            let fixed_count = self.successors.iter()
+                .filter(|s| context.fixed_value(*s).is_some())
+                .count();
+            self.statistics.total_fixed_edges_at_conflict += fixed_count;
+            self.statistics.number_of_conflicts += 1;
+        }
+        result
+    }
+    fn count_fixed(&self, context: &mut PropagationContext) -> usize {
+        self.successors.iter()
+            .filter(|s| context.fixed_value(*s).is_some())
+            .count()
     }
 
     fn create_check_explanation(
