@@ -25,6 +25,8 @@ use pumpkin_core::state::PropagatorConflict;
 use pumpkin_core::predicate;
 use pumpkin_core::predicates::PropositionalConjunction;
 use pumpkin_core::state::Conflict;
+use pumpkin_core::create_statistics_struct;
+use pumpkin_core::statistics::Statistic;
 
 use crate::all_different::AllDifferentChecker;
 
@@ -34,6 +36,25 @@ pub struct AllDifferentConstructor<Var> {
     pub constraint_tag: ConstraintTag,
 }//
 declare_inference_label!(AllDifferent);
+
+create_statistics_struct!(AllDifferentV2Statistics {
+    // Propagation activity
+    propagations_total: usize,
+    propagations_that_found_conflict: usize,
+    propagations_that_pruned: usize,
+    // Pruning magnitude
+    total_values_pruned: usize,
+    // Conflict explanation quality (Hall violation path)
+    total_hall_set_size_conflict: usize,
+    number_of_conflicts: usize,
+    max_hall_set_size_conflict: usize,
+    // Pruning explanation quality (tight Hall set path)
+    total_pruning_hall_set_size: usize,
+    number_of_pruning_explanations: usize,
+    max_pruning_hall_set_size: usize,
+    // Failure depth proxy (same as V0/V1 for three-way comparison)
+    total_fixed_edges_at_conflict: usize,
+});
 
 impl<Var: IntegerVariable + 'static> PropagatorConstructor for AllDifferentConstructor<Var> {
     type PropagatorImpl = AllDifferentPropagator<Var>;
@@ -57,6 +78,7 @@ impl<Var: IntegerVariable + 'static> PropagatorConstructor for AllDifferentConst
         AllDifferentPropagator {
             sucs: self.sucs,
             inference_code: InferenceCode::new(self.constraint_tag, AllDifferent),
+            statistics: AllDifferentV2Statistics::default(),
         }
     }
 
@@ -74,14 +96,19 @@ impl<Var: IntegerVariable + 'static> PropagatorConstructor for AllDifferentConst
 pub struct AllDifferentPropagator<Var> {
     sucs: Box<[Var]>,
     inference_code: InferenceCode,
+    statistics: AllDifferentV2Statistics, 
 }
 
 impl<Var: IntegerVariable + 'static> Propagator for AllDifferentPropagator<Var> {
     fn name(&self) -> &str {
         "AllDifferent"
     }
-    fn propagate(&mut self, mut context: PropagationContext) -> pumpkin_core::state::PropagationStatusCP {
-        self.check_conflict_and_propgate(context)
+    fn log_statistics(&self, statistic_logger: pumpkin_core::statistics::StatisticLogger) {
+        self.statistics.log(statistic_logger);
+    }
+    fn propagate(&mut self, mut context: PropagationContext) -> PropagationStatusCP {
+        self.statistics.propagations_total += 1;
+        self.propagate_with_stats(context)
     }
 
     fn propagate_from_scratch(
@@ -664,6 +691,104 @@ impl<Var: IntegerVariable + 'static> AllDifferentPropagator<Var> {
             }
         }
 
+        for (var_idx, domain_val, reason) in prunings {
+            let var = &self.sucs[var_idx];
+            if context.contains(var, domain_val) {
+                context.post(
+                    predicate!(var != domain_val),
+                    reason,
+                    &self.inference_code,
+                )?;
+            }
+        }
+
+        Ok(())
+    }
+    fn propagate_with_stats(&mut self, mut context: PropagationContext) -> PropagationStatusCP {
+        let domains = context.domains();
+
+        if self.sucs.is_empty() {
+            return Ok(());
+        }
+
+        // Step 1 & 2: graph and matching — same as before
+        let graph = BipartiteGraph::build(&self.sucs, &domains);
+        let matching = hopcroft_karp(&graph);
+
+        // Step 3: conflict check
+        if matching.size < graph.n_vars {
+            self.statistics.propagations_that_found_conflict += 1;
+            self.statistics.number_of_conflicts += 1;
+
+            // Failure depth: count fixed successor variables
+            let fixed_count = self.sucs.iter()
+                .filter(|s| domains.fixed_value(*s).is_some())
+                .count();
+            self.statistics.total_fixed_edges_at_conflict += fixed_count;
+
+            let (hall_vars, hall_vals) = find_hall_set(&graph, &matching);
+
+            // Hall set size for conflict explanation quality
+            let s = hall_vars.len();
+            self.statistics.total_hall_set_size_conflict += s;
+            if s > self.statistics.max_hall_set_size_conflict {
+                self.statistics.max_hall_set_size_conflict = s;
+            }
+
+            let conjunction = self.make_hall_explanation(
+                &domains, &graph, &hall_vars, &hall_vals,
+            );
+            return Err(Conflict::Propagator(PropagatorConflict {
+                conjunction,
+                inference_code: self.inference_code.clone(),
+            }));
+        }
+
+        // Step 4 & 5: residual graph and SCCs
+        let residual = ResidualGraph::build(&graph, &matching);
+        let scc_id = tarjan_scc(&residual);
+
+        // Step 6: collect prunings and instrument
+        let mut prunings: Vec<(usize, i32, PropositionalConjunction)> =
+            Vec::with_capacity(graph.n_vars);
+        let mut values_pruned_this_call = 0usize;
+
+        for i in 0..graph.n_vars {
+            let matched_val = matching.match_var[i];
+            for &v in &graph.adj[i] {
+                if v == matched_val { continue; }
+                let val_node = graph.n_vars + v;
+                if scc_id[i] == scc_id[val_node] { continue; }
+
+                let domain_val = v as i32 + graph.val_offset;
+
+                let (hall_vars, hall_vals) = find_pruning_hall_set(
+                    &graph, &matching, i, v
+                );
+
+                // Tight Hall set size for pruning explanation quality
+                let t = hall_vars.len();
+                self.statistics.total_pruning_hall_set_size += t;
+                self.statistics.number_of_pruning_explanations += 1;
+                if t > self.statistics.max_pruning_hall_set_size {
+                    self.statistics.max_pruning_hall_set_size = t;
+                }
+
+                let explanation = self.make_pruning_explanation_from_hall(
+                    &domains, &graph, &hall_vars, &hall_vals,
+                );
+                prunings.push((i, domain_val, explanation));
+                values_pruned_this_call += 1;
+            }
+        }
+
+        // Update pruning activity stats
+        if values_pruned_this_call > 0 {
+            self.statistics.propagations_that_pruned += 1;
+            self.statistics.total_values_pruned += values_pruned_this_call;
+        }
+
+        // Apply prunings
         for (var_idx, domain_val, reason) in prunings {
             let var = &self.sucs[var_idx];
             if context.contains(var, domain_val) {
