@@ -97,7 +97,7 @@ declare_inference_label!(CircuitPrevent);
 
 create_statistics_struct!(CircuitBaseStatistics {
     //how many propgation calls were triggered by ASSIGN evnet vs other domain changes
-    propagations_triggered_by_assign: usize,
+    propagations_that_found_conflict: usize,
     //Failure depth: total fixed edges at time of each conflic
     //Dividing by the number of conflict (post processing - average dept)
     total_fixed_edges_at_conflict: usize,
@@ -124,7 +124,7 @@ impl<Var: IntegerVariable + 'static> Propagator for CircuitPropagator<Var> {
     }
     fn propagate(&mut self, mut context: PropagationContext) -> PropagationStatusCP {
         self.statistics.propagations_total += 1;
-        self.statistics.propagations_triggered_by_assign +=1;
+        // self.statistics.propagations_triggered_by_assign +=1;
 
         if self.first_iteration {
             self.first_iteration = false;
@@ -301,6 +301,7 @@ impl<Var: IntegerVariable + 'static> CircuitPropagator<Var> {
                 .count();
             self.statistics.total_fixed_edges_at_conflict += fixed_count;
             self.statistics.number_of_conflicts += 1;
+            self.statistics.propagations_that_found_conflict += 1;
         }
         result
     }
