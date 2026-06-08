@@ -54,6 +54,13 @@ create_statistics_struct!(AllDifferentV2Statistics {
     max_pruning_hall_set_size: usize,
     // Failure depth proxy (same as V0/V1 for three-way comparison)
     total_fixed_edges_at_conflict: usize,
+
+    total_vars_involved_in_pruning: usize,  // unique variables that had at least one value pruned
+    max_values_pruned_from_single_var: usize, // answers "small number of nodes pruning a lot?"
+    
+    // SCC size directly
+    total_scc_size_at_pruning: usize,       // sum of SCC sizes when pruning fires
+    number_of_scc_pruning_calls: usize,  
 });
 
 impl<Var: IntegerVariable + 'static> PropagatorConstructor for AllDifferentConstructor<Var> {
@@ -711,24 +718,19 @@ impl<Var: IntegerVariable + 'static> AllDifferentPropagator<Var> {
             return Ok(());
         }
 
-        // Step 1 & 2: graph and matching — same as before
         let graph = BipartiteGraph::build(&self.sucs, &domains);
         let matching = hopcroft_karp(&graph);
 
-        // Step 3: conflict check
         if matching.size < graph.n_vars {
             self.statistics.propagations_that_found_conflict += 1;
             self.statistics.number_of_conflicts += 1;
 
-            // Failure depth: count fixed successor variables
             let fixed_count = self.sucs.iter()
                 .filter(|s| domains.fixed_value(*s).is_some())
                 .count();
             self.statistics.total_fixed_edges_at_conflict += fixed_count;
 
             let (hall_vars, hall_vals) = find_hall_set(&graph, &matching);
-
-            // Hall set size for conflict explanation quality
             let s = hall_vars.len();
             self.statistics.total_hall_set_size_conflict += s;
             if s > self.statistics.max_hall_set_size_conflict {
@@ -744,14 +746,17 @@ impl<Var: IntegerVariable + 'static> AllDifferentPropagator<Var> {
             }));
         }
 
-        // Step 4 & 5: residual graph and SCCs
         let residual = ResidualGraph::build(&graph, &matching);
         let scc_id = tarjan_scc(&residual);
 
-        // Step 6: collect prunings and instrument
         let mut prunings: Vec<(usize, i32, PropositionalConjunction)> =
             Vec::with_capacity(graph.n_vars);
         let mut values_pruned_this_call = 0usize;
+
+        // Track per-variable pruning count for concentration metric
+        let mut pruned_per_var = vec![0usize; graph.n_vars];
+        // Track which pruning SCCs we have already measured to avoid double-counting
+        let mut counted_sccs = std::collections::HashSet::new();
 
         for i in 0..graph.n_vars {
             let matched_val = matching.match_var[i];
@@ -766,7 +771,6 @@ impl<Var: IntegerVariable + 'static> AllDifferentPropagator<Var> {
                     &graph, &matching, i, v
                 );
 
-                // Tight Hall set size for pruning explanation quality
                 let t = hall_vars.len();
                 self.statistics.total_pruning_hall_set_size += t;
                 self.statistics.number_of_pruning_explanations += 1;
@@ -774,21 +778,40 @@ impl<Var: IntegerVariable + 'static> AllDifferentPropagator<Var> {
                     self.statistics.max_pruning_hall_set_size = t;
                 }
 
+                // SCC size: measure each unique pruning SCC once per call
+                if counted_sccs.insert(scc_id[val_node]) {
+                    let scc_size = scc_id.iter()
+                        .filter(|&&s| s == scc_id[val_node])
+                        .count();
+                    self.statistics.total_scc_size_at_pruning += scc_size;
+                }
+
                 let explanation = self.make_pruning_explanation_from_hall(
                     &domains, &graph, &hall_vars, &hall_vals,
                 );
                 prunings.push((i, domain_val, explanation));
+                pruned_per_var[i] += 1;
                 values_pruned_this_call += 1;
             }
         }
 
-        // Update pruning activity stats
+        // Concentration metrics — only meaningful when pruning actually happened
         if values_pruned_this_call > 0 {
             self.statistics.propagations_that_pruned += 1;
             self.statistics.total_values_pruned += values_pruned_this_call;
+            self.statistics.number_of_scc_pruning_calls += 1;
+
+            // How many distinct variables lost at least one value this call
+            let vars_involved = pruned_per_var.iter().filter(|&&c| c > 0).count();
+            self.statistics.total_vars_involved_in_pruning += vars_involved;
+
+            // Worst-case concentration: most values removed from a single variable
+            let max_from_single = pruned_per_var.iter().copied().max().unwrap_or(0);
+            if max_from_single > self.statistics.max_values_pruned_from_single_var {
+                self.statistics.max_values_pruned_from_single_var = max_from_single;
+            }
         }
 
-        // Apply prunings
         for (var_idx, domain_val, reason) in prunings {
             let var = &self.sucs[var_idx];
             if context.contains(var, domain_val) {
