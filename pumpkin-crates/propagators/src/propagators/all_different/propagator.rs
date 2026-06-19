@@ -867,59 +867,6 @@ impl<Var: IntegerVariable + 'static> AllDifferentPropagator<Var> {
             .collect()
     }
     
-    /// Build a minimal explanation for the pruning of value `pruned_val_idx`
-    /// from variable `var_idx`.
-    // fn make_pruning_explanation(
-    //     &self,
-    //     domains: &Domains,
-    //     graph: &BipartiteGraph,
-    //     scc_id: &[usize],
-    //     val_node: usize,
-    // ) -> PropositionalConjunction {
-    //     let target_scc = scc_id[val_node];
-    //     let n_vars = graph.n_vars;
-
-    //     // Collect which value indices are in the target SCC
-    //     let in_val_scc: Vec<bool> = {
-    //         let mut v = vec![false; graph.n_vals];
-    //         for val_idx in 0..graph.n_vals {
-    //             let node = n_vars + val_idx;
-    //             if scc_id[node] == target_scc {
-    //                 v[val_idx] = true;
-    //             }
-    //         }
-    //         v
-    //     };
-
-    //     // For each variable h in the tight SCC, describe its confinement
-    //     // using only bounds and holes that existed at propagation entry.
-    //     (0..n_vars)
-    //         .filter(|&h| scc_id[h] == target_scc)
-    //         .flat_map(|h| {
-    //             let var = &self.sucs[h];
-    //             let lb = domains.lower_bound(var);
-    //             let ub = domains.upper_bound(var);
-
-    //             let mut lits = vec![
-    //                 predicate!(var >= lb),
-    //                 predicate!(var <= ub),
-    //             ];
-    //             for val_idx in 0..graph.n_vals {
-    //                 if in_val_scc[val_idx] {
-    //                     continue; // value is in the tight set, skip
-    //                 }
-    //                 let d = val_idx as i32 + graph.val_offset;
-    //                 if d <= lb || d >= ub {
-    //                     continue; // already excluded by bounds
-    //                 }
-    //                 if !domains.contains(var, d) {
-    //                     lits.push(predicate!(var != d));
-    //                 }
-    //             }
-    //             lits
-    //         })
-    //         .collect()
-    // }
 
     fn make_pruning_explanation_from_hall(
         &self,

@@ -22,20 +22,8 @@ pub struct AllDifferentChecker<Var> {
     pub successors: Box<[Var]>,
 }
 
-/// Main entry point for verifying an inference.
-///
-///
-/// The logic splits into two cases:
-///
-///   - Conflict verification
-///       premises  -> conflict  _> We simply check that the induced domains admit no perfect matching
-///
-///   - Pruning verification
-///       premises ∧ (xi = v)  →  conflict  
-///     We pin xi to {v}, rebuild the bipartite graph, and check that the
-///     matching becomes impossible.
-///
-/// return true is inference is valid
+//Todo: needs to be changed to actually just check for a hall set
+
 impl<Var, Atomic> InferenceChecker<Atomic> for AllDifferentChecker<Var>
 where
     Var: CheckerVariable<Atomic>,
