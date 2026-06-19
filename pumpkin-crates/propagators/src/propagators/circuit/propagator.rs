@@ -17,8 +17,7 @@
 //! 9. Circuit nocycle prevention — block premature closing edges in fixed chains.
 //! 10. Post all collected prunings.
 //!
-//! Three distinct [`InferenceCode`]s are used so the proof log can attribute
-//! each pruning to the correct reasoning
+
 
 use fixedbitset::FixedBitSet;
 use pumpkin_core::declare_inference_label;
@@ -168,7 +167,6 @@ impl<Var: IntegerVariable + 'static> Propagator for CircuitPropagator<Var> {
     }
 }
 
-// ─── Core pipeline ────────────────────────────────────────────────────────────
 
 impl<Var: IntegerVariable + 'static> CircuitPropagator<Var> {
     /// Full propagation pipeline.

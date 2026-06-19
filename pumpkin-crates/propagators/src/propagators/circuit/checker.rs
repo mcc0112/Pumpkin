@@ -1,38 +1,4 @@
-//! Inference checker for the unified Hamiltonian propagator.
-//!
-//! Verifies all three inference codes produced by [`CircuitPropagator`]:
-//!
-//!   - `AllDifferentReason`  — Hall-set conflict or GAC pruning
-//!   - `CircuitReason`       — sub-cycle conflict or nocycle prevent pruning
-//!   - `HallCircuitReason`   — Theorem 4.2 Hall-circuit pruning
-//!
-//! One struct handles all three because the checker dispatches on the
-//! `consequent` argument and tries every valid justification in order.
-//! Pumpkin registers a separate instance per inference code (see
-//! `add_inference_checkers` in `hamiltonian.rs`), but the logic is identical.
-//!
-//! # Verification strategy
-//!
-//! **Conflict** (`consequent = None`):
-//!   1. Rebuild bipartite graph from premise-induced domains and run
-//!      Hopcroft-Karp. If no perfect matching → AllDiff Hall violation → valid.
-//!   2. Otherwise follow fixed edges looking for a sub-cycle shorter than n
-//!      → circuit conflict → valid.
-//!
-//! **Pruning** (`consequent = Some(xi ≠ v)`):
-//!   1. Pin xi = v, rebuild bipartite graph, run Hopcroft-Karp. If no perfect
-//!      matching → AllDiff / HallCircuit justification → valid.
-//!   2. Otherwise check whether the premises describe a fixed chain whose tail
-//!      is xi and whose head is v, with length < n → circuit nocycle → valid.
-//!   3. Otherwise check whether there exists a tight Hall set H with xi as the
-//!      unique entry and v as the unique exit → Theorem 4.2 → valid.
-//!
-//! # Indexing convention
-//!
-//! MiniZinc circuit uses 1-indexed nodes: node `i` (1-indexed) is represented
-//! by `successors[i-1]` (0-indexed), and its successor is the domain value `j`
-//! (1-indexed).  All conversions go through `domain_value_to_index` and
-//! `index_to_domain_value` using `VALUE_OFFSET = 1`.
+
 
 use fixedbitset::FixedBitSet;
 use pumpkin_checking::AtomicConstraint;
@@ -40,10 +6,6 @@ use pumpkin_checking::CheckerVariable;
 use pumpkin_checking::InferenceChecker;
 use pumpkin_checking::VariableState;
 
-// ─── Index / value helpers ────────────────────────────────────────────────────
-// Mirrors the same constants in propagator.rs.
-// MiniZinc circuit constraint numbers nodes 1..=n, so domain values are
-// 1-indexed while array positions are 0-indexed.
 
 const VALUE_OFFSET: i32 = 1;
 
@@ -57,14 +19,12 @@ fn index_to_domain_value(index: usize) -> i32 {
     index as i32 + VALUE_OFFSET
 }
 
-// ─── Checker struct ───────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
 pub struct CircuitChecker<Var> {
     pub successors: Box<[Var]>,
 }
 
-// ─── InferenceChecker impl ────────────────────────────────────────────────────
 
 impl<Var, Atomic> InferenceChecker<Atomic> for CircuitChecker<Var>
 where
@@ -92,6 +52,8 @@ where
 ///   - The premise-induced domains admit no perfect bipartite matching
 ///     (AllDifferent Hall violation), or
 ///   - The fixed edges form a sub-cycle shorter than n (circuit conflict).
+/// 
+/// TODO: change to cehck for hall set
 fn check_conflict<Var, Atomic>(
     successors: &[Var],
     state: &VariableState<Atomic>,
@@ -173,8 +135,7 @@ where
         .position(|var| var.does_atomic_constrain_self(consequent));
 
     // Branch A: AllDiff via matching.
-    // Pin xi = pruned_val; if no perfect matching exists the pruning is
-    // justified by a Hall set.
+
     let (n_vars, n_vals, adj) = build_bipartite(
         successors,
         state,
@@ -200,8 +161,6 @@ where
 }
 
 /// Returns `true` when there is a fixed chain starting at `head_val`
-/// (1-indexed domain value) that ends exactly at `tail_idx` (0-indexed),
-/// and the chain length is strictly less than n.
 fn would_close_premature_chain<Var, Atomic>(
     successors: &[Var],
     state: &VariableState<Atomic>,
@@ -241,20 +200,7 @@ where
 /// Verify Theorem 4.2 by enumerating all proper non-empty subsets of variables
 /// and checking whether any tight Hall set has `pruned_var` as its unique entry
 /// and `pruned_val` as its unique exit.
-///
-/// A tight Hall set H satisfies: the union of domains of variables in H has
-/// exactly |H| elements.
-///
-/// Entry: a variable in H whose 1-indexed node id is NOT in the domain union
-///        (it must route its successor outside H).
-/// Exit:  a domain value in the union whose corresponding node is NOT in H
-///        (it is a target outside H).
-///
-/// Theorem 4.2 says: if |entry| == 1 and |exit| == 1, the entry variable
-/// cannot take the exit value (doing so would force a sub-tour within H).
-///
-/// Subset enumeration is correct and simple for a checker; the propagator uses
-/// the more efficient SCC-based approach to find the same sets.
+
 fn is_hall_circuit_pruning<Var, Atomic>(
     successors: &[Var],
     state: &VariableState<Atomic>,
@@ -344,14 +290,7 @@ where
 
 // ─── Bipartite graph construction ─────────────────────────────────────────────
 
-/// Build the bipartite Var ↔ Val graph from premise-induced domains.
-///
-/// Optionally pins one variable to a singleton (used in pruning checks to
-/// simulate `xi = v`).  Returns `(n_vars, n_vals, adj)`.
-///
-/// Variables with no premise information are treated as unconstrained: they
-/// can take any value in `1..=n`.  An empty induced domain means "no
-/// information", not "no values".
+
 fn build_bipartite<Var, Atomic>(
     successors: &[Var],
     state: &VariableState<Atomic>,
