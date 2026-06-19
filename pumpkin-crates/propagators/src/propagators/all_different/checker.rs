@@ -2,7 +2,6 @@ use pumpkin_checking::AtomicConstraint;
 use pumpkin_checking::CheckerVariable;
 use pumpkin_checking::InferenceChecker;
 use pumpkin_checking::VariableState;
-
 #[derive(Debug, Clone)]
 pub struct AllDifferentChecker<Var> {
     pub successors: Box<[Var]>,
@@ -20,7 +19,7 @@ where
         _consequent: Option<&Atomic>,
     ) -> bool {
         let n_vars = self.successors.len();
-
+        //TODO: change this to just check for hall-set - not the correctness of inference
         // Collect all values reachable across all induced domains.
         // iter_induced_domain returns Option — None means the domain is empty,
         // which itself would be a conflict, so we treat it as no values.
@@ -54,11 +53,9 @@ where
         hopcroft_karp_size(n_vars, n_vals, &adj) < n_vars
     }
 }
-// ---------------------------------------------------------------------------
 // Hopcroft-Karp — returns only the matching size (no need for the full
 // Matching struct here, but we keep the same algorithmic structure as the
 // propagator for consistency and ease of review).
-// ---------------------------------------------------------------------------
 
 const UNMATCHED: usize = usize::MAX;
 const INF_DIST: usize = usize::MAX;
